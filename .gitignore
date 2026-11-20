@@ -1,0 +1,4 @@
+# Build artifacts — never ship these in the image.
+__pycache__/
+*.pyc
+.build-cache/

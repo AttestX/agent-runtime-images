@@ -1,0 +1,48 @@
+# Publish runtime images to GHCR.
+#
+# Tag scheme: <runtime>/<upstream-version>-shim<N>
+#   tradingagents/0.7.1-shim1 -> ghcr.io/botmesh/tradingagents:0.7.1-shim1
+#
+# The ClawUp catalog (backend/bot_runtimes.json) and the local box build
+# (make build-runtime-tradingagents) use the same <suffix>; bump all three
+# together.
+name: publish-runtime-image
+
+on:
+  push:
+    tags:
+      - "tradingagents/*"
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  tradingagents:
+    if: startsWith(github.ref_name, 'tradingagents/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        env:
+          SUFFIX: ${{ github.ref_name }} # tradingagents/0.7.1-shim1
+        run: |
+          set -euo pipefail
+          suffix="${SUFFIX#tradingagents/}"
+          ta_version="v${suffix%%-*}"
+          image="ghcr.io/botmesh/tradingagents:${suffix}"
+          docker build \
+            --build-arg TA_VERSION="${ta_version}" \
+            -t "${image}" \
+            -f tradingagents/Dockerfile tradingagents
+          docker push "${image}"
+          echo "published ${image}"
