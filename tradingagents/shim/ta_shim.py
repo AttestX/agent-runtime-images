@@ -30,6 +30,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -56,6 +57,7 @@ DATA_ROOT = os.environ.get("TA_STATE_DIR") or os.path.join(
 
 HEARTBEAT_SECONDS = float(os.environ.get("TA_SHIM_HEARTBEAT_SECONDS", "30"))
 REPORT_MAX_CHARS = int(os.environ.get("TA_SHIM_REPORT_MAX_CHARS", "4000"))
+REPORT_TAIL_CHARS = int(os.environ.get("TA_SHIM_REPORT_TAIL_CHARS", "3000"))
 LOG_TAIL_LINES = 200
 MODEL_LABEL = "tradingagents-shim"
 
@@ -137,10 +139,7 @@ SUFFIXED_TICKER_RE = re.compile(
 # Bare all-caps tokens: classic 1-5 char US/EU/JP style (AAPL, SPY, AZN).
 # Longer bare tokens are NOT guessed — use the explicit form instead.
 BARE_TICKER_RE = re.compile(r"\b[A-Z]{1,5}\b")
-DECISION_RE = re.compile(
-    r"\b(Strong\s+Buy|Overweight|Buy|Hold|Neutral|Underweight|Sell|Strong\s+Sell|Exchange)\b",
-    re.I,
-)
+DECISION_MARKER_RE = re.compile(r"^\s*[-*]?\s*(?:Final\s+Decision|Decision|Rating):\s*(.+?)\s*$", re.M | re.I)
 
 
 def parse_request(text: str) -> dict | None:
@@ -214,7 +213,8 @@ HELP_TEXT = (
 class Run:
     __slots__ = (
         "ticker", "date", "started_at", "finished_at", "status",
-        "proc", "log", "error", "decision", "report_path", "report_text",
+        "proc", "log", "error", "decision", "report_path", "report_head",
+        "report_tail", "workspace_path",
     )
 
     def __init__(self, ticker: str, date: str) -> None:
@@ -228,7 +228,9 @@ class Run:
         self.error: str | None = None
         self.decision: str | None = None
         self.report_path: str | None = None
-        self.report_text: str | None = None
+        self.report_head: str | None = None
+        self.report_tail: str | None = None
+        self.workspace_path: str | None = None
 
     def elapsed(self) -> str:
         end = self.finished_at or time.time()
@@ -292,6 +294,14 @@ def build_cli_env() -> dict:
         # key env (ANTHROPIC_API_KEY, OPENAI_API_KEY, …), which the backend
         # already injects into the container env.
         env["TRADINGAGENTS_LLM_PROVIDER"] = cfg["llm_provider"]
+        # ClawUp names the Google key GEMINI_API_KEY, but TradingAgents'
+        # native "google" provider reads GOOGLE_API_KEY — alias it.
+        if (
+            cfg["llm_provider"] == "google"
+            and not env.get("GOOGLE_API_KEY")
+            and env.get("GEMINI_API_KEY")
+        ):
+            env["GOOGLE_API_KEY"] = env["GEMINI_API_KEY"]
 
     if cfg["quick_model"]:
         env["TRADINGAGENTS_QUICK_THINK_LLM"] = cfg["quick_model"]
@@ -325,6 +335,7 @@ def _pump(run: Run, proc: subprocess.Popen) -> None:
     if rc == 0:
         run.status = "done"
         _collect_report(run)
+        _mirror_reports_to_workspace(run)
         _extract_decision(run)
         _log(f"run {run.ticker} {run.date} finished ok (report={run.report_path})")
     else:
@@ -379,17 +390,59 @@ def _collect_report(run: Run) -> None:
     _mtime, run.report_path = max(c for c in candidates if rank(c[1]) == best_rank)
     try:
         with open(run.report_path, encoding="utf-8", errors="replace") as fh:
-            run.report_text = fh.read(REPORT_MAX_CHARS * 2)
+            text = fh.read()
+        # Head = the chat excerpt (report top, where the header Rating lives);
+        # tail = where the PM's final-decision section sits.  Both are bounded
+        # so a huge report never bloats a chat message or the decision scan.
+        run.report_head = text[:REPORT_MAX_CHARS]
+        run.report_tail = text[-REPORT_TAIL_CHARS:]
     except OSError as exc:
         _log(f"failed to read report {run.report_path}: {exc}")
 
 
+def _mirror_reports_to_workspace(run: Run) -> None:
+    """Copy the run's report tree into the Files-API-visible workspace.
+
+    The Files API scopes to $STATE_DIR/workspace, while TradingAgents
+    writes reports under $STATE_DIR/logs — without this mirror the full
+    reports (per-analyst sections, risk debate, PM decision) are invisible
+    to the user, who only sees the chat excerpt.
+    """
+    if not run.report_path:
+        return
+    src_dir = os.path.dirname(run.report_path)
+    if src_dir == DATA_ROOT:
+        return
+    dest = os.path.join(DATA_ROOT, "workspace", "reports", os.path.basename(src_dir))
+    try:
+        shutil.copytree(src_dir, dest, dirs_exist_ok=True)
+        run.workspace_path = dest
+    except OSError as exc:
+        _log(f"report mirror to workspace failed (non-fatal): {exc}")
+
+
 def _extract_decision(run: Run) -> None:
-    sources = [run.report_text or "", "\n".join(list(run.log)[-100:])]
-    for text in reversed(sources):
-        matches = DECISION_RE.findall(text)
+    """Extract the FINAL decision from authoritative lines only.
+
+    The report body is full of per-agent rating words (the bull researcher
+    says Buy, the bear says Sell, …), so "last rating word in the text"
+    reverses the verdict whenever the excerpt is truncated mid-report.
+    Trusted sources, in order:
+      1. the report header's "Rating: <X>" line (written from the
+         portfolio manager's verdict at the top of complete_report.md);
+      2. an explicit "Final Decision:" / "Decision:" line — report tail
+         first (the PM section is last), then the CLI log.
+    If neither yields a value, decision stays None and the result omits
+    the line — an absent answer beats a reversed one.
+    """
+    m = DECISION_MARKER_RE.search(run.report_head or "")
+    if m and m.group(1).strip():
+        run.decision = m.group(1).strip()
+        return
+    for text in (run.report_tail, "\n".join(list(run.log)[-100:])):
+        matches = DECISION_MARKER_RE.findall(text or "")
         if matches:
-            run.decision = matches[-1].title().replace(" ", " ")
+            run.decision = matches[-1].strip()
             return
 
 
@@ -500,10 +553,11 @@ def _result_text(run: Run) -> str:
     lines = [f"{run.ticker} {run.date} analysis complete (took {run.elapsed()})."]
     if run.decision:
         lines.append(f"Final decision: {run.decision}")
-    if run.report_path:
-        lines.append(f"Report saved to: {run.report_path}")
-    if run.report_text:
-        lines.append("\n--- Report excerpt ---\n" + run.report_text[:REPORT_MAX_CHARS])
+    if run.workspace_path or run.report_path:
+        # Prefer the workspace path: that is what the Files API exposes.
+        lines.append(f"Report saved to: {run.workspace_path or run.report_path}")
+    if run.report_head:
+        lines.append("\n--- Report excerpt ---\n" + run.report_head)
     return "\n".join(lines)
 
 
