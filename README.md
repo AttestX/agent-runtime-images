@@ -44,10 +44,24 @@ bump `N` and rebuild; when upstream moves on, bump the version part.
 
 ## Publishing
 
-Push a tag `<runtime>/<upstream-version>-shim<N>` (e.g.
-`tradingagents/0.7.1-shim1`) — the `publish-runtime-image` workflow builds
-and pushes `ghcr.io/botmesh/<runtime>:<suffix>` (single arch; add a matrix
-only when ClawUp targets more than one).
+**This repo's CI publishes the images.** When a PR merges into `main`
+(or on manual dispatch), the `publish-runtime-image` workflow builds
+`tradingagents/Dockerfile` and pushes it to GHCR. The image reference is
+derived from this repo:
+
+```
+ghcr.io/botmesh/tradingagents:<TA_VERSION from Dockerfile>-<SHIM_REVISION from workflow>
+```
+
+so bumping the upstream pin (Dockerfile `ARG`) or the shim revision
+(workflow `env`) and merging publishes a new reference.
+
+**ClawUp's catalog** (`backend/bot_runtimes.json`,
+`tradingagents.default_image`) must carry the **same reference** — keep
+them in sync when bumping. The box's provisioner auto-pulls on first bot
+creation (`ensureImage` is local-first), which needs a GHCR read
+credential on the docker daemon (a `read:packages` PAT via
+`docker login ghcr.io`).
 
 ## Building on the ClawUp box
 

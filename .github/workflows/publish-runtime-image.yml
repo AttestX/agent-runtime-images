@@ -1,28 +1,43 @@
 # Publish runtime images to GHCR.
 #
-# Tag scheme: <runtime>/<upstream-version>-shim<N>
-#   tradingagents/0.7.1-shim1 -> ghcr.io/botmesh/tradingagents:0.7.1-shim1
+# Trigger: a PR merged into main (or manual dispatch) — the image content
+# merge IS the release event. The image reference is derived from this repo:
+#   upstream pin  <- tradingagents/Dockerfile (ARG TA_VERSION)
+#   shim revision <- SHIM_REVISION below
+# so bumping either (and merging) publishes a new reference.
 #
-# The ClawUp catalog (backend/bot_runtimes.json) and the local box build
-# (make build-runtime-tradingagents) use the same <suffix>; bump all three
-# together.
+# ClawUp's catalog (backend/bot_runtimes.json, tradingagents.default_image)
+# must carry the SAME reference — keep them in sync when bumping.
 name: publish-runtime-image
 
 on:
   push:
-    tags:
-      - "tradingagents/*"
+    branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: read
   packages: write
 
+env:
+  SHIM_REVISION: shim1
+
 jobs:
   tradingagents:
-    if: startsWith(github.ref_name, 'tradingagents/')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Resolve image reference
+        id: ref
+        run: |
+          ta_version=$(sed -n 's/^ARG TA_VERSION=//p' tradingagents/Dockerfile | head -1 | sed 's/^v//')
+          if [ -z "$ta_version" ]; then
+            echo "::error::could not read TA_VERSION from tradingagents/Dockerfile"
+            exit 1
+          fi
+          image="ghcr.io/botmesh/tradingagents:${ta_version}-${SHIM_REVISION}"
+          echo "image=$image" >> "$GITHUB_OUTPUT"
 
       - uses: docker/setup-buildx-action@v3
 
@@ -34,15 +49,11 @@ jobs:
 
       - name: Build and push
         env:
-          SUFFIX: ${{ github.ref_name }} # tradingagents/0.7.1-shim1
+          IMAGE: ${{ steps.ref.outputs.image }}
         run: |
           set -euo pipefail
-          suffix="${SUFFIX#tradingagents/}"
-          ta_version="v${suffix%%-*}"
-          image="ghcr.io/botmesh/tradingagents:${suffix}"
           docker build \
-            --build-arg TA_VERSION="${ta_version}" \
-            -t "${image}" \
+            -t "$IMAGE" \
             -f tradingagents/Dockerfile tradingagents
-          docker push "${image}"
-          echo "published ${image}"
+          docker push "$IMAGE"
+          echo "published $IMAGE"
