@@ -1,10 +1,19 @@
 # agent-runtime-images
 
 Runtime images for the [ClawUp](https://github.com/BotMesh/ClawUp) agent
-platform — the images ClawUp's runtime provisioner pulls for bot containers
-where ClawUp bakes its own gateway shim into an upstream runtime (i.e. upstream
-projects that publish no registry image, or whose image does not speak
-ClawUp's gateway contract).
+platform.
+
+ClawUp supports three runtimes (authoritative list: ClawUp's
+`backend/bot_runtimes.json` catalog). Two of them use **upstream open-source
+images directly** — they are listed here for reference only and are NOT built
+in this repo. This repo builds the one that needs a ClawUp-baked gateway shim
+(because upstream publishes no registry image and no HTTP surface):
+
+| Runtime | Image | Source |
+|---|---|---|
+| **openclaw** | `ghcr.io/openclaw/openclaw:2026.7.1` (catalog; the provisioner's `PROVISIONER_RUNTIME_IMAGE` fallback may point at `alpine/openclaw:…`) | Upstream open source — pulled directly, not built here |
+| **hermes** | `nousresearch/hermes-agent:v2026.7.1` | Upstream open source — pulled directly, not built here |
+| **tradingagents** | `clawup/tradingagents:0.7.1-shim1` (local) / `ghcr.io/botmesh/tradingagents:0.7.1-shim1` (published) | **Built here** — `tradingagents/` (upstream v0.7.1 + ClawUp gateway shim) |
 
 ## Layout
 
