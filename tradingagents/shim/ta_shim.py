@@ -236,7 +236,7 @@ class Run:
         return f"{s // 60:02d}:{s % 60:02d}"
 
     def status_text(self) -> str:
-        return f"⏳ {self.ticker} {self.date} analysis in progress, running for {self.elapsed()}."
+        return f"{self.ticker} {self.date} analysis in progress, running for {self.elapsed()}."
 
 
 class RunSlot:
@@ -496,8 +496,8 @@ def _send_sse_start(handler: BaseHTTPRequestHandler) -> None:
 
 def _result_text(run: Run) -> str:
     if run.status == "error":
-        return f"❌ Analysis failed.\n{run.error or 'unknown error'}"
-    lines = [f"✅ {run.ticker} {run.date} analysis complete (took {run.elapsed()})."]
+        return f"Analysis failed.\n{run.error or 'unknown error'}"
+    lines = [f"{run.ticker} {run.date} analysis complete (took {run.elapsed()})."]
     if run.decision:
         lines.append(f"Final decision: {run.decision}")
     if run.report_path:
@@ -569,7 +569,7 @@ def _handle_chat(handler: BaseHTTPRequestHandler, body: bytes) -> None:
         if run.status == "running":
             if started_now:
                 content = (
-                    f"🚀 Started {run.ticker} {run.date} analysis. "
+                    f"Started {run.ticker} {run.date} analysis. "
                     "This usually takes 10-40 minutes — send any message (e.g. 'progress') "
                     "later to check on it."
                 )
@@ -584,7 +584,7 @@ def _handle_chat(handler: BaseHTTPRequestHandler, body: bytes) -> None:
     _send_sse_start(handler)
     if started_now:
         intro = (
-            f"🚀 Starting analysis of {run.ticker} (date {run.date}). "
+            f"Starting analysis of {run.ticker} (date {run.date}). "
             "Pipeline: analyst team → bull/bear researcher debate → trader → "
             "risk team → portfolio manager. This usually takes 10-40 minutes; "
             "I'll report progress as it runs, and you can ask 'progress' anytime."
@@ -614,7 +614,7 @@ def _handle_chat(handler: BaseHTTPRequestHandler, body: bytes) -> None:
         if run.status != "running":
             break
         if time.time() - last_beat >= HEARTBEAT_SECONDS:
-            if not _sse_chunk(handler, {"role": "assistant", "content": f"\n⏳ running for {run.elapsed()}\n"}, None):
+            if not _sse_chunk(handler, {"role": "assistant", "content": f"\nrunning for {run.elapsed()}\n"}, None):
                 return  # client gone; run continues in background
             last_beat = time.time()
 
