@@ -30,6 +30,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -56,6 +57,7 @@ DATA_ROOT = os.environ.get("TA_STATE_DIR") or os.path.join(
 
 HEARTBEAT_SECONDS = float(os.environ.get("TA_SHIM_HEARTBEAT_SECONDS", "30"))
 REPORT_MAX_CHARS = int(os.environ.get("TA_SHIM_REPORT_MAX_CHARS", "4000"))
+REPORT_TAIL_CHARS = int(os.environ.get("TA_SHIM_REPORT_TAIL_CHARS", "3000"))
 LOG_TAIL_LINES = 200
 MODEL_LABEL = "tradingagents-shim"
 
@@ -137,10 +139,7 @@ SUFFIXED_TICKER_RE = re.compile(
 # Bare all-caps tokens: classic 1-5 char US/EU/JP style (AAPL, SPY, AZN).
 # Longer bare tokens are NOT guessed — use the explicit form instead.
 BARE_TICKER_RE = re.compile(r"\b[A-Z]{1,5}\b")
-DECISION_RE = re.compile(
-    r"\b(Strong\s+Buy|Overweight|Buy|Hold|Neutral|Underweight|Sell|Strong\s+Sell|Exchange)\b",
-    re.I,
-)
+DECISION_MARKER_RE = re.compile(r"^\s*[-*]?\s*(?:Final\s+Decision|Decision|Rating):\s*(.+?)\s*$", re.M | re.I)
 
 
 def parse_request(text: str) -> dict | None:
@@ -176,6 +175,49 @@ def parse_request(text: str) -> dict | None:
     return {"ticker": ticker, "date": date}
 
 
+# "re-run it" style intent — overrides the cached-result shortcut below.
+REANALYZE_RE = re.compile(
+    r"\b(re-?run|re-?analyze|reanalysis|refresh|again)\b|重新|再来|再(跑|分析|来)", re.I
+)
+
+
+def _explicit_date_in(text: str) -> str | None:
+    m = EXPLICIT_DATE_RE.search(text) or BARE_DATE_RE.search(text)
+    if not m:
+        return None
+    return f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
+
+
+def resolve_turn(text: str, parsed: dict | None, current: "Run | None") -> str:
+    """Decide what a chat turn does (pure function; testable without HTTP).
+
+    Returns:
+      "help"   — nothing to do: no ticker parsed and no run to report on
+      "status" — a run is in flight; report its progress
+      "result" — show the finished run's result (or its error)
+      "start"  — start a new run (parsed carries ticker/date)
+
+    Follow-up policy (review finding: "show the report for NVDA" must NOT
+    burn another run): after a finished run, a message naming the same
+    ticker without an explicit *different* date returns the cached result;
+    an explicit different date or a re-run keyword starts a fresh analysis.
+    """
+    if current is None:
+        return "help" if parsed is None else "start"
+    if current.status == "running":
+        return "status"
+    if parsed is None:
+        return "result"
+    if parsed["ticker"].lower() != current.ticker.lower():
+        return "start"
+    if REANALYZE_RE.search(text):
+        return "start"
+    explicit = _explicit_date_in(text)
+    if explicit is not None and explicit != current.date:
+        return "start"
+    return "result"
+
+
 def last_user_text(messages) -> str:
     for msg in reversed(messages or []):
         if not isinstance(msg, dict) or msg.get("role") != "user":
@@ -202,7 +244,9 @@ HELP_TEXT = (
     "Any market Yahoo Finance covers works (US, HK .HK, A-shares .SS/.SZ, crypto -USD, …).\n"
     "An analysis runs the full multi-agent pipeline (analyst team → bull/bear debate → "
     "trader → risk team → portfolio manager) and typically takes 10-40 minutes. "
-    "You can ask me for progress at any time."
+    "You can ask me for progress at any time.\n"
+    "After a run finishes, asking about the same ticker returns its saved result — "
+    "to run it again, name an explicit date or say 're-run'."
 )
 
 
@@ -214,7 +258,8 @@ HELP_TEXT = (
 class Run:
     __slots__ = (
         "ticker", "date", "started_at", "finished_at", "status",
-        "proc", "log", "error", "decision", "report_path", "report_text",
+        "proc", "log", "error", "decision", "report_path", "report_head",
+        "report_tail", "workspace_path",
     )
 
     def __init__(self, ticker: str, date: str) -> None:
@@ -228,7 +273,9 @@ class Run:
         self.error: str | None = None
         self.decision: str | None = None
         self.report_path: str | None = None
-        self.report_text: str | None = None
+        self.report_head: str | None = None
+        self.report_tail: str | None = None
+        self.workspace_path: str | None = None
 
     def elapsed(self) -> str:
         end = self.finished_at or time.time()
@@ -292,6 +339,14 @@ def build_cli_env() -> dict:
         # key env (ANTHROPIC_API_KEY, OPENAI_API_KEY, …), which the backend
         # already injects into the container env.
         env["TRADINGAGENTS_LLM_PROVIDER"] = cfg["llm_provider"]
+        # ClawUp names the Google key GEMINI_API_KEY, but TradingAgents'
+        # native "google" provider reads GOOGLE_API_KEY — alias it.
+        if (
+            cfg["llm_provider"] == "google"
+            and not env.get("GOOGLE_API_KEY")
+            and env.get("GEMINI_API_KEY")
+        ):
+            env["GOOGLE_API_KEY"] = env["GEMINI_API_KEY"]
 
     if cfg["quick_model"]:
         env["TRADINGAGENTS_QUICK_THINK_LLM"] = cfg["quick_model"]
@@ -300,12 +355,42 @@ def build_cli_env() -> dict:
     env["TRADINGAGENTS_OUTPUT_LANGUAGE"] = cfg["output_language"] or "English"
     env["TRADINGAGENTS_MAX_DEBATE_ROUNDS"] = cfg["max_debate_rounds"] or "1"
     env["TRADINGAGENTS_MAX_RISK_ROUNDS"] = cfg["max_risk_rounds"] or "1"
+    # Point the CLI's data root (hardwired to $HOME/.tradingagents upstream)
+    # at the shim's state dir, whatever its layout — see _cli_home.
+    env["HOME"] = _cli_home()
     return env
 
 
 # Crypto asset types have no fundamentals (no filings); the CLI rejects the
 # rest-of-the-set default for them.  Suffixes per upstream cli/prompts.py.
 CRYPTO_SUFFIXES = ("-USD", "-USDT", "-USDC", "-BTC", "-ETH")
+
+
+def _cli_home() -> str:
+    """A HOME whose ~/.tradingagents IS the shim's DATA_ROOT.
+
+    Upstream computes its whole data root from Path.home() at import time —
+    results_dir, data_cache_dir and memory_log_path all under
+    $HOME/.tradingagents — and exposes no single env override for the root.
+    When DATA_ROOT already sits at $HOME/.tradingagents nothing is needed;
+    otherwise build a tiny bridge home containing a symlink so results,
+    checkpoints and the memory log land inside the backed-up state dir for
+    ANY deploy account (default, root, custom) instead of silently escaping
+    it.
+    """
+    home = os.environ.get("HOME", "")
+    d = os.path.realpath(DATA_ROOT)
+    if home and os.path.realpath(os.path.join(home, ".tradingagents")) == d:
+        return home
+    bridge = os.path.join(DATA_ROOT, ".clawup-home")
+    link = os.path.join(bridge, ".tradingagents")
+    os.makedirs(bridge, exist_ok=True)
+    if not os.path.islink(link):
+        try:
+            os.symlink(d, link)
+        except FileExistsError:
+            pass  # someone already put a real dir there; leave it be
+    return bridge
 
 
 def default_analysts(ticker: str) -> str:
@@ -323,16 +408,21 @@ def _pump(run: Run, proc: subprocess.Popen) -> None:
     rc = proc.wait()
     tail = "\n".join(list(run.log)[-40:])
     if rc == 0:
-        run.status = "done"
+        # Collect the results BEFORE publishing "done": other handler
+        # threads read run.status concurrently, and a momentary
+        # done-without-report state is exactly what makes the SSE reply
+        # say "analysis complete" with no result attached.
         _collect_report(run)
+        _mirror_reports_to_workspace(run)
         _extract_decision(run)
+        run.status = "done"
         _log(f"run {run.ticker} {run.date} finished ok (report={run.report_path})")
     else:
-        run.status = "error"
         run.error = (
             f"TradingAgents CLI exited with code {rc}.\n"
             f"--- last {min(40, len(list(run.log)))} lines ---\n{tail}"
         )
+        run.status = "error"
         _log(f"run {run.ticker} {run.date} failed rc={rc}")
     run.finished_at = time.time()
 
@@ -362,7 +452,27 @@ def _collect_report(run: Run) -> None:
                 candidates.append((mtime, path))
     if not candidates:
         return
-    candidates.sort()
+    # Scope candidates to THIS run.  Report dirs are named <TICKER>_<ts>
+    # (consolidated) and <TICKER>/<date> (per-role); a file that names
+    # another ticker belongs to an earlier run — adopting it is how an
+    # AAPL analysis once returned a stale NVDA report after its own
+    # consolidated report failed to save.  Files naming neither (e.g. the
+    # cross-ticker memory log) are never "the report".
+    ticker_lc = run.ticker.lower()
+
+    def scope(path: str) -> int:
+        p = path.lower()
+        if ticker_lc in p:
+            return 0
+        if run.date in p:
+            return 1
+        return 2
+
+    scoped = [c for c in candidates if scope(c[1]) <= 1]
+    if not scoped:
+        _log(f"no report file names run {run.ticker} {run.date}; not adopting a foreign report")
+        return
+    scoped.sort()
 
     def rank(path: str) -> int:
         p = path.lower()
@@ -375,21 +485,63 @@ def _collect_report(run: Run) -> None:
         return 3
 
     # Best rank wins; within a rank, newest mtime.
-    best_rank = min(rank(p) for _m, p in candidates)
-    _mtime, run.report_path = max(c for c in candidates if rank(c[1]) == best_rank)
+    best_rank = min(rank(p) for _m, p in scoped)
+    _mtime, run.report_path = max(c for c in scoped if rank(c[1]) == best_rank)
     try:
         with open(run.report_path, encoding="utf-8", errors="replace") as fh:
-            run.report_text = fh.read(REPORT_MAX_CHARS * 2)
+            text = fh.read()
+        # Head = the chat excerpt (report top, where the header Rating lives);
+        # tail = where the PM's final-decision section sits.  Both are bounded
+        # so a huge report never bloats a chat message or the decision scan.
+        run.report_head = text[:REPORT_MAX_CHARS]
+        run.report_tail = text[-REPORT_TAIL_CHARS:]
     except OSError as exc:
         _log(f"failed to read report {run.report_path}: {exc}")
 
 
+def _mirror_reports_to_workspace(run: Run) -> None:
+    """Copy the run's report tree into the Files-API-visible workspace.
+
+    The Files API scopes to $STATE_DIR/workspace, while TradingAgents
+    writes reports under $STATE_DIR/logs — without this mirror the full
+    reports (per-analyst sections, risk debate, PM decision) are invisible
+    to the user, who only sees the chat excerpt.
+    """
+    if not run.report_path:
+        return
+    src_dir = os.path.dirname(run.report_path)
+    if src_dir == DATA_ROOT:
+        return
+    dest = os.path.join(DATA_ROOT, "workspace", "reports", os.path.basename(src_dir))
+    try:
+        shutil.copytree(src_dir, dest, dirs_exist_ok=True)
+        run.workspace_path = dest
+    except OSError as exc:
+        _log(f"report mirror to workspace failed (non-fatal): {exc}")
+
+
 def _extract_decision(run: Run) -> None:
-    sources = [run.report_text or "", "\n".join(list(run.log)[-100:])]
-    for text in reversed(sources):
-        matches = DECISION_RE.findall(text)
+    """Extract the FINAL decision from authoritative lines only.
+
+    The report body is full of per-agent rating words (the bull researcher
+    says Buy, the bear says Sell, …), so "last rating word in the text"
+    reverses the verdict whenever the excerpt is truncated mid-report.
+    Trusted sources, in order:
+      1. the report header's "Rating: <X>" line (written from the
+         portfolio manager's verdict at the top of complete_report.md);
+      2. an explicit "Final Decision:" / "Decision:" line — report tail
+         first (the PM section is last), then the CLI log.
+    If neither yields a value, decision stays None and the result omits
+    the line — an absent answer beats a reversed one.
+    """
+    m = DECISION_MARKER_RE.search(run.report_head or "")
+    if m and m.group(1).strip():
+        run.decision = m.group(1).strip()
+        return
+    for text in (run.report_tail, "\n".join(list(run.log)[-100:])):
+        matches = DECISION_MARKER_RE.findall(text or "")
         if matches:
-            run.decision = matches[-1].title().replace(" ", " ")
+            run.decision = matches[-1].strip()
             return
 
 
@@ -500,10 +652,11 @@ def _result_text(run: Run) -> str:
     lines = [f"{run.ticker} {run.date} analysis complete (took {run.elapsed()})."]
     if run.decision:
         lines.append(f"Final decision: {run.decision}")
-    if run.report_path:
-        lines.append(f"Report saved to: {run.report_path}")
-    if run.report_text:
-        lines.append("\n--- Report excerpt ---\n" + run.report_text[:REPORT_MAX_CHARS])
+    if run.workspace_path or run.report_path:
+        # Prefer the workspace path: that is what the Files API exposes.
+        lines.append(f"Report saved to: {run.workspace_path or run.report_path}")
+    if run.report_head:
+        lines.append("\n--- Report excerpt ---\n" + run.report_head)
     return "\n".join(lines)
 
 
@@ -530,30 +683,22 @@ def _handle_chat(handler: BaseHTTPRequestHandler, body: bytes) -> None:
 
     parsed = parse_request(text)
     current = SLOT.get()
+    action = resolve_turn(text, parsed, current)
 
-    if current is not None and current.status == "running":
-        # Single-flight: while a run is in flight, every turn reports progress
-        # (claim() refuses to start a second one anyway).
-        run, started_now = current, False
-    elif current is not None and current.status in ("done", "error"):
-        if parsed is None:
-            # 'progress' / 'last result' style follow-up -> show the last result.
-            run, started_now = current, False
+    if action == "help":
+        content = "I couldn't tell which ticker to analyze.\n" + HELP_TEXT
+        if stream:
+            _send_sse_start(handler)
+            _sse_chunk(handler, {"role": "assistant", "content": content}, None)
+            _sse_chunk(handler, {}, "stop")
+            _sse_done(handler)
         else:
-            run, started_now = SLOT.claim(parsed["ticker"], parsed["date"])
-            if started_now:
-                _start_proc(run)
-    else:
-        if parsed is None:
-            content = "I couldn't tell which ticker to analyze.\n" + HELP_TEXT
-            if stream:
-                _send_sse_start(handler)
-                _sse_chunk(handler, {"role": "assistant", "content": content}, None)
-                _sse_chunk(handler, {}, "stop")
-                _sse_done(handler)
-            else:
-                _send_chat_completion(handler, content)
-            return
+            _send_chat_completion(handler, content)
+        return
+
+    if action in ("status", "result"):
+        run, started_now = current, False
+    else:  # start
         run, started_now = SLOT.claim(parsed["ticker"], parsed["date"])
         if started_now:
             _start_proc(run)
