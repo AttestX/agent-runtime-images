@@ -66,7 +66,7 @@ export PATH=/opt/venv/bin:\$PATH; exec python3 /opt/ta-shim/ta_shim.py"
 curl -s http://127.0.0.1:18788/ready
 curl -s -X POST http://127.0.0.1:18788/v1/chat/completions \
   -H "Authorization: Bearer e2e-token" -H 'Content-Type: application/json' \
-  -d '{"messages":[{"role":"user","content":"分析 NVDA 2026-11-19"}],"stream":false}'
+  -d '{"messages":[{"role":"user","content":"Analyze NVDA on 2026-11-19"}],"stream":false}'
 # then poll: curl -s http://127.0.0.1:18788/v1/ta/status -H "Authorization: Bearer e2e-token"
 ```
 
