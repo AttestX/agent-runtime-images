@@ -195,13 +195,14 @@ def last_user_text(messages) -> str:
 
 
 HELP_TEXT = (
-    "请告诉我要分析的股票代码和日期，例如：\n"
-    "  • 分析 NVDA 2026-11-20\n"
+    "Please tell me which ticker and date to analyze, e.g.:\n"
+    "  • Analyze NVDA on 2026-11-20\n"
     "  • ticker: 600519.SS  date: 2026-11-19\n"
-    "  • 看看 BTC-USD 今天怎么样\n"
-    "支持 Yahoo Finance 覆盖的任意市场（美股 / 港股 .HK / A股 .SS .SZ / 加密 -USD 等）。"
-    "一次分析会运行多智能体流程（分析师 → 多空辩论 → 交易员 → 风控 → 组合经理），"
-    "通常需要 10-40 分钟，期间可以随时问我进度。"
+    "  • How is BTC-USD doing today?\n"
+    "Any market Yahoo Finance covers works (US, HK .HK, A-shares .SS/.SZ, crypto -USD, …).\n"
+    "An analysis runs the full multi-agent pipeline (analyst team → bull/bear debate → "
+    "trader → risk team → portfolio manager) and typically takes 10-40 minutes. "
+    "You can ask me for progress at any time."
 )
 
 
@@ -235,7 +236,7 @@ class Run:
         return f"{s // 60:02d}:{s % 60:02d}"
 
     def status_text(self) -> str:
-        return f"⏳ {self.ticker} {self.date} 分析进行中，已运行 {self.elapsed()}。"
+        return f"{self.ticker} {self.date} analysis in progress, running for {self.elapsed()}."
 
 
 class RunSlot:
@@ -495,14 +496,14 @@ def _send_sse_start(handler: BaseHTTPRequestHandler) -> None:
 
 def _result_text(run: Run) -> str:
     if run.status == "error":
-        return f"❌ 分析失败。\n{run.error or 'unknown error'}"
-    lines = [f"✅ {run.ticker} {run.date} 分析完成（用时 {run.elapsed()}）。"]
+        return f"Analysis failed.\n{run.error or 'unknown error'}"
+    lines = [f"{run.ticker} {run.date} analysis complete (took {run.elapsed()})."]
     if run.decision:
-        lines.append(f"最终决策: {run.decision}")
+        lines.append(f"Final decision: {run.decision}")
     if run.report_path:
-        lines.append(f"报告已保存: {run.report_path}")
+        lines.append(f"Report saved to: {run.report_path}")
     if run.report_text:
-        lines.append("\n--- 报告摘录 ---\n" + run.report_text[:REPORT_MAX_CHARS])
+        lines.append("\n--- Report excerpt ---\n" + run.report_text[:REPORT_MAX_CHARS])
     return "\n".join(lines)
 
 
@@ -536,7 +537,7 @@ def _handle_chat(handler: BaseHTTPRequestHandler, body: bytes) -> None:
         run, started_now = current, False
     elif current is not None and current.status in ("done", "error"):
         if parsed is None:
-            # "进度" / "上次结果" style follow-up -> show the last result.
+            # 'progress' / 'last result' style follow-up -> show the last result.
             run, started_now = current, False
         else:
             run, started_now = SLOT.claim(parsed["ticker"], parsed["date"])
@@ -544,7 +545,7 @@ def _handle_chat(handler: BaseHTTPRequestHandler, body: bytes) -> None:
                 _start_proc(run)
     else:
         if parsed is None:
-            content = "我没看懂要分析哪只标的。\n" + HELP_TEXT
+            content = "I couldn't tell which ticker to analyze.\n" + HELP_TEXT
             if stream:
                 _send_sse_start(handler)
                 _sse_chunk(handler, {"role": "assistant", "content": content}, None)
@@ -568,8 +569,9 @@ def _handle_chat(handler: BaseHTTPRequestHandler, body: bytes) -> None:
         if run.status == "running":
             if started_now:
                 content = (
-                    f"🚀 已启动 {run.ticker} {run.date} 分析。"
-                    "通常需要 10-40 分钟，稍后发任意消息（如“进度”）即可查询。"
+                    f"Started {run.ticker} {run.date} analysis. "
+                    "This usually takes 10-40 minutes — send any message (e.g. 'progress') "
+                    "later to check on it."
                 )
             else:
                 content = run.status_text()
@@ -582,9 +584,10 @@ def _handle_chat(handler: BaseHTTPRequestHandler, body: bytes) -> None:
     _send_sse_start(handler)
     if started_now:
         intro = (
-            f"🚀 开始分析 {run.ticker}（日期 {run.date}）。"
-            "流程：分析师团队 → 多空研究员辩论 → 交易员 → 风控团队 → 组合经理。"
-            "通常需要 10-40 分钟，我会持续报告进度；期间你也可以直接问我“进度”。"
+            f"Starting analysis of {run.ticker} (date {run.date}). "
+            "Pipeline: analyst team → bull/bear researcher debate → trader → "
+            "risk team → portfolio manager. This usually takes 10-40 minutes; "
+            "I'll report progress as it runs, and you can ask 'progress' anytime."
         )
         if not _sse_chunk(handler, {"role": "assistant", "content": intro + "\n"}, None):
             return  # client gone; run continues in background
@@ -611,7 +614,7 @@ def _handle_chat(handler: BaseHTTPRequestHandler, body: bytes) -> None:
         if run.status != "running":
             break
         if time.time() - last_beat >= HEARTBEAT_SECONDS:
-            if not _sse_chunk(handler, {"role": "assistant", "content": f"\n⏳ 已运行 {run.elapsed()}\n"}, None):
+            if not _sse_chunk(handler, {"role": "assistant", "content": f"\nrunning for {run.elapsed()}\n"}, None):
                 return  # client gone; run continues in background
             last_beat = time.time()
 
