@@ -175,6 +175,49 @@ def parse_request(text: str) -> dict | None:
     return {"ticker": ticker, "date": date}
 
 
+# "re-run it" style intent — overrides the cached-result shortcut below.
+REANALYZE_RE = re.compile(
+    r"\b(re-?run|re-?analyze|reanalysis|refresh|again)\b|重新|再来|再(跑|分析|来)", re.I
+)
+
+
+def _explicit_date_in(text: str) -> str | None:
+    m = EXPLICIT_DATE_RE.search(text) or BARE_DATE_RE.search(text)
+    if not m:
+        return None
+    return f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
+
+
+def resolve_turn(text: str, parsed: dict | None, current: "Run | None") -> str:
+    """Decide what a chat turn does (pure function; testable without HTTP).
+
+    Returns:
+      "help"   — nothing to do: no ticker parsed and no run to report on
+      "status" — a run is in flight; report its progress
+      "result" — show the finished run's result (or its error)
+      "start"  — start a new run (parsed carries ticker/date)
+
+    Follow-up policy (review finding: "show the report for NVDA" must NOT
+    burn another run): after a finished run, a message naming the same
+    ticker without an explicit *different* date returns the cached result;
+    an explicit different date or a re-run keyword starts a fresh analysis.
+    """
+    if current is None:
+        return "help" if parsed is None else "start"
+    if current.status == "running":
+        return "status"
+    if parsed is None:
+        return "result"
+    if parsed["ticker"].lower() != current.ticker.lower():
+        return "start"
+    if REANALYZE_RE.search(text):
+        return "start"
+    explicit = _explicit_date_in(text)
+    if explicit is not None and explicit != current.date:
+        return "start"
+    return "result"
+
+
 def last_user_text(messages) -> str:
     for msg in reversed(messages or []):
         if not isinstance(msg, dict) or msg.get("role") != "user":
@@ -201,7 +244,9 @@ HELP_TEXT = (
     "Any market Yahoo Finance covers works (US, HK .HK, A-shares .SS/.SZ, crypto -USD, …).\n"
     "An analysis runs the full multi-agent pipeline (analyst team → bull/bear debate → "
     "trader → risk team → portfolio manager) and typically takes 10-40 minutes. "
-    "You can ask me for progress at any time."
+    "You can ask me for progress at any time.\n"
+    "After a run finishes, asking about the same ticker returns its saved result — "
+    "to run it again, name an explicit date or say 're-run'."
 )
 
 
@@ -310,12 +355,42 @@ def build_cli_env() -> dict:
     env["TRADINGAGENTS_OUTPUT_LANGUAGE"] = cfg["output_language"] or "English"
     env["TRADINGAGENTS_MAX_DEBATE_ROUNDS"] = cfg["max_debate_rounds"] or "1"
     env["TRADINGAGENTS_MAX_RISK_ROUNDS"] = cfg["max_risk_rounds"] or "1"
+    # Point the CLI's data root (hardwired to $HOME/.tradingagents upstream)
+    # at the shim's state dir, whatever its layout — see _cli_home.
+    env["HOME"] = _cli_home()
     return env
 
 
 # Crypto asset types have no fundamentals (no filings); the CLI rejects the
 # rest-of-the-set default for them.  Suffixes per upstream cli/prompts.py.
 CRYPTO_SUFFIXES = ("-USD", "-USDT", "-USDC", "-BTC", "-ETH")
+
+
+def _cli_home() -> str:
+    """A HOME whose ~/.tradingagents IS the shim's DATA_ROOT.
+
+    Upstream computes its whole data root from Path.home() at import time —
+    results_dir, data_cache_dir and memory_log_path all under
+    $HOME/.tradingagents — and exposes no single env override for the root.
+    When DATA_ROOT already sits at $HOME/.tradingagents nothing is needed;
+    otherwise build a tiny bridge home containing a symlink so results,
+    checkpoints and the memory log land inside the backed-up state dir for
+    ANY deploy account (default, root, custom) instead of silently escaping
+    it.
+    """
+    home = os.environ.get("HOME", "")
+    d = os.path.realpath(DATA_ROOT)
+    if home and os.path.realpath(os.path.join(home, ".tradingagents")) == d:
+        return home
+    bridge = os.path.join(DATA_ROOT, ".clawup-home")
+    link = os.path.join(bridge, ".tradingagents")
+    os.makedirs(bridge, exist_ok=True)
+    if not os.path.islink(link):
+        try:
+            os.symlink(d, link)
+        except FileExistsError:
+            pass  # someone already put a real dir there; leave it be
+    return bridge
 
 
 def default_analysts(ticker: str) -> str:
@@ -333,17 +408,21 @@ def _pump(run: Run, proc: subprocess.Popen) -> None:
     rc = proc.wait()
     tail = "\n".join(list(run.log)[-40:])
     if rc == 0:
-        run.status = "done"
+        # Collect the results BEFORE publishing "done": other handler
+        # threads read run.status concurrently, and a momentary
+        # done-without-report state is exactly what makes the SSE reply
+        # say "analysis complete" with no result attached.
         _collect_report(run)
         _mirror_reports_to_workspace(run)
         _extract_decision(run)
+        run.status = "done"
         _log(f"run {run.ticker} {run.date} finished ok (report={run.report_path})")
     else:
-        run.status = "error"
         run.error = (
             f"TradingAgents CLI exited with code {rc}.\n"
             f"--- last {min(40, len(list(run.log)))} lines ---\n{tail}"
         )
+        run.status = "error"
         _log(f"run {run.ticker} {run.date} failed rc={rc}")
     run.finished_at = time.time()
 
@@ -373,7 +452,27 @@ def _collect_report(run: Run) -> None:
                 candidates.append((mtime, path))
     if not candidates:
         return
-    candidates.sort()
+    # Scope candidates to THIS run.  Report dirs are named <TICKER>_<ts>
+    # (consolidated) and <TICKER>/<date> (per-role); a file that names
+    # another ticker belongs to an earlier run — adopting it is how an
+    # AAPL analysis once returned a stale NVDA report after its own
+    # consolidated report failed to save.  Files naming neither (e.g. the
+    # cross-ticker memory log) are never "the report".
+    ticker_lc = run.ticker.lower()
+
+    def scope(path: str) -> int:
+        p = path.lower()
+        if ticker_lc in p:
+            return 0
+        if run.date in p:
+            return 1
+        return 2
+
+    scoped = [c for c in candidates if scope(c[1]) <= 1]
+    if not scoped:
+        _log(f"no report file names run {run.ticker} {run.date}; not adopting a foreign report")
+        return
+    scoped.sort()
 
     def rank(path: str) -> int:
         p = path.lower()
@@ -386,8 +485,8 @@ def _collect_report(run: Run) -> None:
         return 3
 
     # Best rank wins; within a rank, newest mtime.
-    best_rank = min(rank(p) for _m, p in candidates)
-    _mtime, run.report_path = max(c for c in candidates if rank(c[1]) == best_rank)
+    best_rank = min(rank(p) for _m, p in scoped)
+    _mtime, run.report_path = max(c for c in scoped if rank(c[1]) == best_rank)
     try:
         with open(run.report_path, encoding="utf-8", errors="replace") as fh:
             text = fh.read()
@@ -584,30 +683,22 @@ def _handle_chat(handler: BaseHTTPRequestHandler, body: bytes) -> None:
 
     parsed = parse_request(text)
     current = SLOT.get()
+    action = resolve_turn(text, parsed, current)
 
-    if current is not None and current.status == "running":
-        # Single-flight: while a run is in flight, every turn reports progress
-        # (claim() refuses to start a second one anyway).
-        run, started_now = current, False
-    elif current is not None and current.status in ("done", "error"):
-        if parsed is None:
-            # 'progress' / 'last result' style follow-up -> show the last result.
-            run, started_now = current, False
+    if action == "help":
+        content = "I couldn't tell which ticker to analyze.\n" + HELP_TEXT
+        if stream:
+            _send_sse_start(handler)
+            _sse_chunk(handler, {"role": "assistant", "content": content}, None)
+            _sse_chunk(handler, {}, "stop")
+            _sse_done(handler)
         else:
-            run, started_now = SLOT.claim(parsed["ticker"], parsed["date"])
-            if started_now:
-                _start_proc(run)
-    else:
-        if parsed is None:
-            content = "I couldn't tell which ticker to analyze.\n" + HELP_TEXT
-            if stream:
-                _send_sse_start(handler)
-                _sse_chunk(handler, {"role": "assistant", "content": content}, None)
-                _sse_chunk(handler, {}, "stop")
-                _sse_done(handler)
-            else:
-                _send_chat_completion(handler, content)
-            return
+            _send_chat_completion(handler, content)
+        return
+
+    if action in ("status", "result"):
+        run, started_now = current, False
+    else:  # start
         run, started_now = SLOT.claim(parsed["ticker"], parsed["date"])
         if started_now:
             _start_proc(run)
