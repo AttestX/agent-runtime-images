@@ -1,6 +1,6 @@
 # agent-runtime-images
 
-Runtime images for the [ClawUp](https://github.com/BotMesh/ClawUp) agent
+Runtime images for the [ClawUp](https://github.com/attestx/ClawUp) agent
 platform.
 
 ClawUp supports three runtimes (authoritative list: ClawUp's
@@ -11,9 +11,12 @@ in this repo. This repo builds the one that needs a ClawUp-baked gateway shim
 
 | Runtime | Image | Source |
 |---|---|---|
-| **openclaw** | `ghcr.io/openclaw/openclaw:2026.7.1` (catalog; the provisioner's `PROVISIONER_RUNTIME_IMAGE` fallback may point at `alpine/openclaw:…`) | Upstream open source — pulled directly, not built here |
-| **hermes** | `nousresearch/hermes-agent:v2026.7.1` | Upstream open source — pulled directly, not built here |
-| **tradingagents** | `clawup/tradingagents:0.7.1-shim1` (local) / `ghcr.io/botmesh/tradingagents:0.7.1-shim1` (published) | **Built here** — `tradingagents/` (upstream v0.7.1 + ClawUp gateway shim) |
+| **openclaw** | `ghcr.io/openclaw/openclaw:2026.11.6` (catalog; Compose has a separate fallback) | Upstream open source — pulled directly, not built here |
+| **hermes** | `nousresearch/hermes-agent:v0.23.3` | Upstream open source — pulled directly, not built here |
+| **tradingagents** | `ghcr.io/botmesh/tradingagents:0.7.1-shim2` (current catalog); this PR builds `0.7.1-shim3` | **Built here** — `tradingagents/` (upstream v0.7.1 + ClawUp gateway shim) |
+
+The Python gateway adapter here is distinct from the Rust `trusted-shim` node
+service. It does not schedule containers or generate policy proofs.
 
 ## Layout
 
@@ -30,10 +33,10 @@ tradingagents/
 
 ## Image naming
 
-- **Local / box builds** (what the ClawUp catalog references today):
+- **Local / box builds** (optional development tags):
   `clawup/<runtime>:<upstream-version>-shim<N>`, e.g.
-  `clawup/tradingagents:0.7.1-shim1`.
-- **GHCR publishes**: `ghcr.io/botmesh/<runtime>:<upstream-version>-shim<N>`
+  `clawup/tradingagents:0.7.1-shim3`.
+- **GHCR publishes**: `ghcr.io/<repository-owner>/<runtime>:<upstream-version>-shim<N>`
   (same suffix). The ClawUp catalog entry in `backend/bot_runtimes.json` and
   the `Makefile` target in ClawUp must carry the **same tag** — bump them
   together.
@@ -50,22 +53,26 @@ bump `N` and rebuild; when upstream moves on, bump the version part.
 derived from this repo:
 
 ```
-ghcr.io/botmesh/tradingagents:<TA_VERSION from Dockerfile>-<SHIM_REVISION from workflow>
+ghcr.io/attestx/tradingagents:<TA_VERSION from Dockerfile>-<SHIM_REVISION from workflow>
 ```
 
-so bumping the upstream pin (Dockerfile `ARG`) or the shim revision
+The workflow also publishes `sha-<full-commit>` for immutable candidate selection.
+The existing BotMesh catalog image remains usable; switch the catalog to the new
+owner/version only after its image is available.
+
+Bumping the upstream pin (Dockerfile `ARG`) or the shim revision
 (workflow `env`) and merging publishes a new reference.
 
 **ClawUp's catalog** (`backend/bot_runtimes.json`,
 `tradingagents.default_image`) must carry the **same reference** — keep
 them in sync when bumping. The box's provisioner auto-pulls on first bot
 creation (`ensureImage` is local-first), which needs a GHCR read
-credential on the docker daemon (a `read:packages` PAT via
+credential when the package is private (a `read:packages` PAT via
 `docker login ghcr.io`).
 
 ## Building on the ClawUp box
 
-ClawUp's `make build-runtime-tradingagents` clones this repo (pinned ref,
+ClawUp's `make build-runtime-tradingagents` clones this repo (selected ref, default `main`,
 cached under `.build-cache/`) and builds locally — the provisioner's
 `ensureImage` is local-first, so no registry is required for box production.
 
@@ -78,5 +85,5 @@ cached under `.build-cache/`) and builds locally — the provisioner's
    `POST /v1/chat/completions` (OpenAI-compatible, Bearer gateway token).
    See ClawUp's `design/opencode-runtime.md` for the full contract.
 3. Add a catalog entry in ClawUp (`backend/bot_runtimes.json`) + the
-   provisioner branches — the per-runtime integration lives in ClawUp, this
-   repo holds only the images.
+   shared runtime adapter registration (`runtime_<engine>.go`). Keep agent-name
+   branches out of generic lifecycle/backend code. This repo holds only images.

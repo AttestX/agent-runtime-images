@@ -14,13 +14,13 @@ Upstream publishes no registry image, so it is built here:
 # from a clone of this repo):
 docker build \
   --build-arg TA_VERSION=v0.7.1 \
-  -t clawup/tradingagents:0.7.1-shim1 \
+  -t clawup/tradingagents:0.7.1-shim3 \
   -f Dockerfile .
 
-# GHCR publish: push tag `tradingagents/0.7.1-shim1` (see repo workflow)
+# GHCR publish: merge to main or dispatch publish-runtime-image (see repo workflow)
 ```
 
-**The tag must match the catalog entry in ClawUp's
+**Publish the image before updating the catalog entry in ClawUp's
 `backend/bot_runtimes.json` — bump them together.** (Tag =
 `<upstream-version>-shim<N>`: `N` is ClawUp's shim revision, independent of
 the upstream pin.)
@@ -56,7 +56,7 @@ docker run -d --name ta-e2e \
   -e OPENCLAW_STATE_DIR=/home/appuser/.tradingagents \
   -e OPENCLAW_GATEWAY_TOKEN=e2e-token -e MOCK_KEY=mock-key \
   -p 127.0.0.1:18788:18789 \
-  clawup/tradingagents:0.7.1-shim1 \
+  clawup/tradingagents:0.7.1-shim3 \
   sh -lc "TA_MODE='compatible' TA_LLM_PROVIDER='' TA_QUICK_MODEL='mock-model' \
 TA_DEEP_MODEL='mock-model' TA_BACKEND_URL='http://host.docker.internal:9999/v1' \
 TA_API_KEY_ENV='MOCK_KEY' TA_API_KEY_RAW=\"\${MOCK_KEY:-}\" \
