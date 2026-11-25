@@ -15,7 +15,7 @@ An order is, in this order:
      Hyperliquid adapter states for the same order. No mandate, no trading;
   2. signed by the owner's Privy wallet, through the Privy agent-wallet CLI.
      Hyperliquid has only a hash of the action signed, so the request carries
-     the action itself (`hyperliquid_action`): the proxy can then check that
+     the action itself (header `x-hyperliquid-action`): the proxy can then check that
      the action hashes to what is signed, and decide it (trusted-rail);
   3. posted to Hyperliquid's /exchange.
 
@@ -27,6 +27,7 @@ without the SDK.
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import math
 import os
@@ -37,7 +38,10 @@ import urllib.error
 import urllib.request
 from decimal import ROUND_CEILING, Decimal
 
-EXCHANGE_HOST = "api.hyperliquid.xyz"
+# TA_HL_NETWORK=testnet trades on Hyperliquid's testnet (free test USDC) and
+# signs as testnet; anything else is mainnet.
+MAINNET = os.environ.get("TA_HL_NETWORK", "mainnet").strip().lower() != "testnet"
+EXCHANGE_HOST = "api.hyperliquid.xyz" if MAINNET else "api.hyperliquid-testnet.xyz"
 BASE_URL = f"https://{EXCHANGE_HOST}"
 SLIPPAGE = 0.05
 # Absolute by default: the provisioner sets the container's PATH itself.
@@ -135,9 +139,8 @@ def mandate_parameters(coin: str, side: str, price_wire: str, size_wire: str) ->
     }
 
 
-def privy_body(typed: dict, action: dict, nonce: int) -> dict:
-    """The Privy RPC body: sign the typed data, and carry the action it hashes.
-    Key order matters for the hash, and json.dumps keeps it."""
+def privy_body(typed: dict) -> dict:
+    """The Privy RPC body: sign the typed data. Privy refuses any other field."""
     return {
         "method": "eth_signTypedData_v4",
         "params": {
@@ -148,8 +151,15 @@ def privy_body(typed: dict, action: dict, nonce: int) -> dict:
                 "message": typed["message"],
             }
         },
-        "hyperliquid_action": {"action": action, "nonce": nonce, "vaultAddress": None},
     }
+
+
+def action_header(action: dict, nonce: int) -> str:
+    """The x-hyperliquid-action header: the action as the `/exchange` body
+    carries it, without the signature, JSON in base64. Key order matters for
+    the hash, and json.dumps keeps it."""
+    shown = {"action": action, "nonce": nonce, "vaultAddress": None}
+    return base64.b64encode(json.dumps(shown).encode()).decode()
 
 
 def split_signature(sig: str) -> dict:
@@ -163,9 +173,12 @@ def split_signature(sig: str) -> dict:
     return {"r": "0x" + raw[:32].hex(), "s": "0x" + raw[32:64].hex(), "v": v}
 
 
-def privy(args: list[str], stdin: str | None = None) -> str:
+def privy(args: list[str], stdin: str | None = None, hyperliquid_action: str | None = None) -> str:
+    env = privy_env()
+    if hyperliquid_action:
+        env["PRIVY_HYPERLIQUID_ACTION"] = hyperliquid_action  # sent as a header (privy_host.cjs)
     proc = subprocess.run(
-        [PRIVY_CLI, *args], input=stdin, capture_output=True, text=True, timeout=60, env=privy_env()
+        [PRIVY_CLI, *args], input=stdin, capture_output=True, text=True, timeout=60, env=env
     )
     if proc.returncode != 0:
         raise RuntimeError((proc.stderr or proc.stdout).strip()[-400:] or "the Privy CLI failed")
@@ -257,9 +270,11 @@ def place(ticker: str, rating: str, usd: float) -> dict:
     if not allowed:
         return {"ok": False, "message": why}
 
-    typed = l1_payload(construct_phantom_agent(action_hash(action, None, nonce, None), True))
+    typed = l1_payload(construct_phantom_agent(action_hash(action, None, nonce, None), MAINNET))
     typed["message"]["connectionId"] = "0x" + typed["message"]["connectionId"].hex()
-    answer = json.loads(privy(["rpc"], stdin=json.dumps(privy_body(typed, action, nonce))))
+    answer = json.loads(privy(
+        ["rpc"], stdin=json.dumps(privy_body(typed)), hyperliquid_action=action_header(action, nonce)
+    ))
     sig = (answer.get("data") or {}).get("signature") or answer.get("signature")
     if not sig:
         return {"ok": False, "message": "Privy returned no signature"}

@@ -58,6 +58,7 @@ venv (`/opt/hl`).
 | `TA_TRADE_ORDER_USD` | The size of a buy, in US dollars |
 | `CLAWUP_MANDATE`, `CLAWUP_API_KEY` | The ClawUp mandate each order is asked of, and a `cu_` key with `mandates:decide`. Without them nothing is traded |
 | `CLAWUP_API_URL` | Default `https://api.clawup.org` |
+| `TA_HL_NETWORK` | `testnet` trades on Hyperliquid's testnet and signs as testnet; default mainnet |
 
 An order is:
 
@@ -65,7 +66,9 @@ An order is:
    Hyperliquid adapter would type it, and placed only on `allow`;
 2. **signed by the owner's Privy wallet** through the Privy agent-wallet CLI. Privy holds the
    key. Hyperliquid has only a hash of the action signed, so the signing request carries the
-   action itself (`hyperliquid_action`), and a proxy running trusted-rail checks that the action
+   action itself, in an `x-hyperliquid-action` header (Privy refuses unknown body fields, and
+   its request signature covers only the body; `shim/privy_host.cjs` adds the header to the
+   CLI's RPC call). A proxy running trusted-rail checks that the action
    hashes to what is signed, then decides it;
 3. **posted** to `https://api.hyperliquid.xyz/exchange`.
 

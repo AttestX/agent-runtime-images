@@ -686,6 +686,7 @@ class Login:
         rc = proc.wait()
         with self._lock:
             self.result = "connected" if rc == 0 else (" ".join(self.output)[-300:] or f"exit {rc}")
+        _log(f"privy login ended: {self.result}")
         ready.set()
 
     def pending(self) -> bool:
@@ -710,7 +711,9 @@ def wallet_reply(command: str) -> str:
     try:
         address = hl_trade.wallet_address()
     except (OSError, RuntimeError, subprocess.TimeoutExpired) as e:
-        return f"No wallet connected ({e}). Say 'connect wallet' to sign in to Privy."
+        ended = LOGIN.result
+        why = f" The last login ended: {ended}." if ended and ended != "connected" else ""
+        return f"No wallet connected ({e}).{why} Say 'connect wallet' to sign in to Privy."
     if not TRADE_ENABLED:
         trading = "Trading is off for this agent."
     elif TRADE_ORDER_USD <= 0:

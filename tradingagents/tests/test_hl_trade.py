@@ -57,17 +57,32 @@ class Orders(unittest.TestCase):
             "rail": "hyperliquid", "side": "buy", "symbol": "btc", "venue": "api.hyperliquid.xyz",
         })
 
-    def test_the_privy_request_carries_the_action_in_order(self):
+    def test_testnet_is_a_switch(self):
+        import subprocess
+        code = "import hl_trade as t; print(t.MAINNET, t.EXCHANGE_HOST)"
+        def host(value):
+            env = dict(os.environ, TA_HL_NETWORK=value)
+            return subprocess.run([sys.executable, "-c", code], cwd=SHIM_DIR, env=env,
+                                  capture_output=True, text=True).stdout.strip()
+        self.assertEqual(host("testnet"), "False api.hyperliquid-testnet.xyz")
+        self.assertEqual(host(""), "True api.hyperliquid.xyz")
+        self.assertEqual(host("TESTNET "), "False api.hyperliquid-testnet.xyz")
+
+    def test_the_privy_body_is_only_what_privy_takes(self):
         typed = {"domain": {"chainId": 1337, "name": "Exchange"}, "types": {}, "primaryType": "Agent",
                  "message": {"source": "a", "connectionId": "0x" + "00" * 32}}
-        action = {"type": "order", "orders": [{"a": 0, "b": True, "p": "1", "s": "1", "r": False,
-                                               "t": {"limit": {"tif": "Ioc"}}}], "grouping": "na"}
-        body = json.loads(json.dumps(t.privy_body(typed, action, 7)))
+        body = t.privy_body(typed)
+        # Privy refuses unknown keys ("Unrecognized key(s) in object", seen live).
+        self.assertEqual(list(body), ["method", "params"])
         self.assertEqual(body["method"], "eth_signTypedData_v4")
         self.assertEqual(body["params"]["typed_data"]["primary_type"], "Agent")
-        shown = body["hyperliquid_action"]
+
+    def test_the_action_header_keeps_the_key_order(self):
+        import base64
+        action = {"type": "order", "orders": [{"a": 0, "b": True, "p": "1", "s": "1", "r": False,
+                                               "t": {"limit": {"tif": "Ioc"}}}], "grouping": "na"}
+        shown = json.loads(base64.b64decode(t.action_header(action, 7)))
         self.assertEqual(shown, {"action": action, "nonce": 7, "vaultAddress": None})
-        # The hash depends on key order, and it survives the JSON round trip.
         self.assertEqual(list(shown["action"]), ["type", "orders", "grouping"])
         self.assertEqual(list(shown["action"]["orders"][0]), ["a", "b", "p", "s", "r", "t"])
 
