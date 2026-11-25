@@ -20,7 +20,7 @@ permissions:
   packages: write
 
 env:
-  SHIM_REVISION: shim3
+  SHIM_REVISION: shim4
 
 jobs:
   tradingagents:

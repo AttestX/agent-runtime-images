@@ -19,7 +19,9 @@ Design rules:
    passed through the documented TRADINGAGENTS_* environment variables only,
    so the shim survives upstream Python-API churn.
 3. **Stdlib only.**  The image already carries TradingAgents' heavy
-   dependency tree; the shim adds nothing to it.
+   dependency tree; the shim adds nothing to it.  Trading (optional, off
+   unless TA_TRADE_HYPERLIQUID is set) runs in hl_trade.py, in its own venv
+   with the Hyperliquid SDK, signed by the owner's Privy wallet.
 
 Configuration arrives as TA_* env vars exported by the provisioner's
 bootstrap script (see runtime-provisioner/scripts.go, buildTradingAgentsBootstrap).
@@ -60,6 +62,18 @@ REPORT_MAX_CHARS = int(os.environ.get("TA_SHIM_REPORT_MAX_CHARS", "4000"))
 REPORT_TAIL_CHARS = int(os.environ.get("TA_SHIM_REPORT_TAIL_CHARS", "3000"))
 LOG_TAIL_LINES = 200
 MODEL_LABEL = "tradingagents-shim"
+
+# Trading on Hyperliquid after an analysis (hl_trade.py). Off by default.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import hl_trade  # noqa: E402  (stdlib at import; the SDK runs in HL_PYTHON)
+
+TRADE_ENABLED = os.environ.get("TA_TRADE_HYPERLIQUID", "").strip().lower() in ("1", "true", "yes")
+try:
+    TRADE_ORDER_USD = float(os.environ.get("TA_TRADE_ORDER_USD", "0") or 0)
+except ValueError:
+    TRADE_ORDER_USD = 0.0
+HL_PYTHON = os.environ.get("TA_HL_PYTHON", "/opt/hl/bin/python")
+TRADE_TIMEOUT_SECONDS = 120
 
 
 def ta_config() -> dict:
@@ -254,7 +268,9 @@ HELP_TEXT = (
     "trader → risk team → portfolio manager) and typically takes 10-40 minutes. "
     "You can ask me for progress at any time.\n"
     "After a run finishes, asking about the same ticker returns its saved result — "
-    "to run it again, name an explicit date or say 're-run'."
+    "to run it again, name an explicit date or say 're-run'.\n"
+    "Trading on Hyperliquid (when the owner has turned it on): 'connect wallet' signs in "
+    "your Privy wallet, 'wallet' shows it, 'disconnect wallet' signs out."
 )
 
 
@@ -267,7 +283,7 @@ class Run:
     __slots__ = (
         "ticker", "date", "started_at", "finished_at", "status",
         "proc", "log", "error", "decision", "report_path", "report_head",
-        "report_tail", "workspace_path",
+        "report_tail", "workspace_path", "trade",
     )
 
     def __init__(self, ticker: str, date: str) -> None:
@@ -284,6 +300,7 @@ class Run:
         self.report_head: str | None = None
         self.report_tail: str | None = None
         self.workspace_path: str | None = None
+        self.trade: str | None = None
 
     def elapsed(self) -> str:
         end = self.finished_at or time.time()
@@ -423,6 +440,7 @@ def _pump(run: Run, proc: subprocess.Popen) -> None:
         _collect_report(run)
         _mirror_reports_to_workspace(run)
         _extract_decision(run)
+        run.trade = _trade(run)
         run.status = "done"
         _log(f"run {run.ticker} {run.date} finished ok (report={run.report_path})")
     else:
@@ -559,6 +577,164 @@ def _extract_decision(run: Run) -> None:
             return
 
 
+def _trade(run: Run) -> str | None:
+    """At most one Hyperliquid order for a finished analysis (hl_trade.py).
+    None when trading is off or the ticker is not crypto quoted in dollars."""
+    if not TRADE_ENABLED or hl_trade.coin_of(run.ticker) is None:
+        return None
+    if hl_trade.side_of(run.decision) is None:
+        return f"no order: the rating is {run.decision or 'unknown'}"
+    if TRADE_ORDER_USD <= 0:
+        return "no order: the order size (TA_TRADE_ORDER_USD) is not set"
+    cmd = [
+        HL_PYTHON, os.path.join(os.path.dirname(os.path.abspath(__file__)), "hl_trade.py"),
+        "order", "--ticker", run.ticker, "--rating", run.decision or "", "--usd", str(TRADE_ORDER_USD),
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=TRADE_TIMEOUT_SECONDS)
+        lines = [ln for ln in proc.stdout.splitlines() if ln.strip()]
+        result = json.loads(lines[-1]) if lines else {}
+    except (OSError, subprocess.TimeoutExpired, ValueError) as e:
+        result = {"ok": False, "message": f"the trade did not run ({type(e).__name__})"}
+    message = str(result.get("message") or "the trade returned nothing")
+    _log(f"trade {run.ticker} {run.decision}: {message}")
+    return message if result.get("ok") else f"not traded: {message}"
+
+
+# ---------------------------------------------------------------------------
+# The owner's Privy wallet (chat commands)
+# ---------------------------------------------------------------------------
+
+WALLET_COMMANDS = {
+    "status": ("wallet", "wallet status", "my wallet", "钱包", "钱包状态", "我的钱包"),
+    "connect": ("connect wallet", "connect my wallet", "wallet login", "login wallet",
+                "连接钱包", "登录钱包", "钱包登录"),
+    "disconnect": ("disconnect wallet", "disconnect my wallet", "wallet logout", "logout wallet",
+                   "断开钱包", "退出钱包", "钱包退出"),
+}
+
+
+def wallet_command(text: str) -> str | None:
+    """'connect wallet' -> "connect", ...; None for anything else."""
+    t = re.sub(r"[\s.!?。！？]+", " ", (text or "").strip().lower()).strip()
+    for command, phrases in WALLET_COMMANDS.items():
+        if t in phrases:
+            return command
+    return None
+
+
+class Login:
+    """One Privy device login at a time. The CLI prints a URL and a code,
+    then waits until the owner approves; the wait outlives the chat turn."""
+
+    URL_RE = re.compile(r"https://\S+")
+    CODE_RE = re.compile(r"Your code:\s*(\S+)")
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.proc: subprocess.Popen | None = None
+        self.url: str | None = None
+        self.code: str | None = None
+        self.output: deque = deque(maxlen=40)
+        self.result: str | None = None  # "connected" | an error, once the CLI exits
+
+    def start(self) -> str:
+        with self._lock:
+            if self.proc is not None and self.proc.poll() is None and self.url:
+                return self._prompt()
+            self.url = self.code = self.result = None
+            self.output.clear()
+            ready = threading.Event()
+            try:
+                self.proc = subprocess.Popen(
+                    [hl_trade.PRIVY_CLI, "login"], env=hl_trade.privy_env(), text=True,
+                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                )
+            except OSError as e:
+                return f"The Privy CLI is not available here ({e})."
+            threading.Thread(target=self._read, args=(self.proc, ready), daemon=True).start()
+        ready.wait(30)
+        with self._lock:
+            if self.url and self.code:
+                return self._prompt()
+            tail = " ".join(self.output).strip()
+            if "Already logged in" in tail:
+                return "Your wallet is already connected. Say 'wallet' to see it."
+            return f"Privy did not start a login: {tail[-300:] or 'no answer'}"
+
+    def _prompt(self) -> str:
+        return (
+            f"Open {self.url} and approve with code {self.code}. "
+            "Privy holds the key; this agent only asks it to sign. "
+            "Say 'wallet' afterwards to check."
+        )
+
+    def _read(self, proc: subprocess.Popen, ready: threading.Event) -> None:
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            line = line.strip()
+            if not line:
+                continue
+            with self._lock:
+                self.output.append(line)
+                if self.url is None and (m := self.URL_RE.search(line)):
+                    self.url = m.group(0)
+                if (m := self.CODE_RE.search(line)):
+                    self.code = m.group(1)
+                if self.url and self.code:
+                    ready.set()
+        rc = proc.wait()
+        with self._lock:
+            self.result = "connected" if rc == 0 else (" ".join(self.output)[-300:] or f"exit {rc}")
+        _log(f"privy login ended: {self.result}")
+        ready.set()
+
+    def pending(self) -> bool:
+        with self._lock:
+            return self.proc is not None and self.proc.poll() is None
+
+
+LOGIN = Login()
+
+
+def wallet_reply(command: str) -> str:
+    if command == "connect":
+        return LOGIN.start()
+    if command == "disconnect":
+        try:
+            hl_trade.privy(["logout"])
+        except (OSError, RuntimeError, subprocess.TimeoutExpired) as e:
+            return f"Could not disconnect: {e}"
+        return "Wallet disconnected. This agent can no longer sign."
+    if LOGIN.pending():
+        return "Waiting for you to approve the login in Privy. " + LOGIN._prompt()
+    try:
+        address = hl_trade.wallet_address()
+    except (OSError, RuntimeError, subprocess.TimeoutExpired) as e:
+        ended = LOGIN.result
+        why = f" The last login ended: {ended}." if ended and ended != "connected" else ""
+        return f"No wallet connected ({e}).{why} Say 'connect wallet' to sign in to Privy."
+    if not TRADE_ENABLED:
+        trading = "Trading is off for this agent."
+    elif TRADE_ORDER_USD <= 0:
+        trading = "Trading is on, but no order size is set, so nothing is traded."
+    else:
+        trading = (
+            f"After a Buy rating on a crypto ticker this agent buys ${TRADE_ORDER_USD:g} of it on "
+            "Hyperliquid; after a Sell it closes the long. Each order is first asked of your "
+            "ClawUp mandate."
+        )
+    account = hl_trade.ACCOUNT
+    if account and account.lower() != address.lower():
+        trades_for = (
+            f" It trades for the Hyperliquid account {account}, which must have approved "
+            f"{address} as an API wallet."
+        )
+    else:
+        trades_for = " It trades for its own Hyperliquid account."
+    return f"Wallet: {address} (Privy).{trades_for} {trading}"
+
+
 def _start_proc(run: Run) -> None:
     cfg = ta_config()
     analysts = cfg["analysts"] or default_analysts(run.ticker)
@@ -666,6 +842,8 @@ def _result_text(run: Run) -> str:
     lines = [f"{run.ticker} {run.date} analysis complete (took {run.elapsed()})."]
     if run.decision:
         lines.append(f"Final decision: {run.decision}")
+    if run.trade:
+        lines.append(f"Hyperliquid: {run.trade}")
     if run.workspace_path or run.report_path:
         # Prefer the workspace path: that is what the Files API exposes.
         lines.append(f"Report saved to: {run.workspace_path or run.report_path}")
@@ -686,6 +864,18 @@ def _handle_chat(handler: BaseHTTPRequestHandler, body: bytes) -> None:
 
     if not text.strip():
         content = HELP_TEXT
+        if stream:
+            _send_sse_start(handler)
+            _sse_chunk(handler, {"role": "assistant", "content": content}, None)
+            _sse_chunk(handler, {}, "stop")
+            _sse_done(handler)
+        else:
+            _send_chat_completion(handler, content)
+        return
+
+    command = wallet_command(text)
+    if command is not None:
+        content = wallet_reply(command)
         if stream:
             _send_sse_start(handler)
             _sse_chunk(handler, {"role": "assistant", "content": content}, None)
@@ -830,6 +1020,7 @@ class Handler(BaseHTTPRequestHandler):
                     "decision": run.decision,
                     "report_path": run.report_path,
                     "error": run.error,
+                    "trade": run.trade,
                 }
             _send_json(self, 200, obj)
             return
