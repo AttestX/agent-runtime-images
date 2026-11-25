@@ -6,23 +6,25 @@ At most one order per finished analysis, on the coin's perpetual:
   * a Sell (or Underweight) rating closes a long position, reduce-only.
     No shorts are opened and leverage is never changed.
 
-Every order is a limit order (IOC, 5% through the mid price, as the SDK's
-market orders are), so its value is stated: price times size.
-
-An order is, in this order:
+Orders are the official SDK's (hyperliquid-python-sdk's Exchange:
+market_open and market_close, IOC limits 5% through the mid), so their value
+is stated: price times size. The SDK signs with a local key; here the key is
+in Privy, so the SDK is given a RemoteSigner instead. Every order the SDK
+signs goes through it, and is, in this order:
   1. asked of the owner's ClawUp mandate (CLAWUP_MANDATE, with CLAWUP_API_KEY):
-     it is placed only on a signed "allow", with the parameters trusted-rail's
+     signed only on a signed "allow", with the parameters trusted-rail's
      Hyperliquid adapter states for the same order. No mandate, no trading;
   2. signed by the owner's Privy wallet, through the Privy agent-wallet CLI.
      Hyperliquid has only a hash of the action signed, so the request carries
-     the action itself (header `x-hyperliquid-action`): the proxy can then check that
-     the action hashes to what is signed, and decide it (trusted-rail);
-  3. posted to Hyperliquid's /exchange.
+     the action itself (header `x-signed-payload`): the proxy can then check
+     that it hashes to what is signed, and decide it (trusted-rail);
+then the SDK posts it to Hyperliquid's /exchange. Anything else the SDK would
+sign (withdrawals, transfers) is refused by the signer.
 
-Runs in its own venv with hyperliquid-python-sdk (/opt/hl); the shim calls
+Runs in its own venv with the SDK (/opt/hl); the shim calls
 `python hl_trade.py <command> ...` and reads one JSON object from stdout.
-The helpers above `main` use the standard library only, so they are tested
-without the SDK.
+The helpers above `RemoteSigner` use the standard library only, so they are
+tested without the SDK.
 """
 from __future__ import annotations
 
@@ -105,13 +107,6 @@ def side_of(rating: str | None) -> str | None:
     return None
 
 
-def limit_price(mid: float, is_buy: bool, sz_decimals: int) -> float:
-    """As the SDK prices a market order: 5% through the mid, five significant
-    figures, at most 6 - szDecimals decimals (perpetuals)."""
-    px = mid * (1 + SLIPPAGE) if is_buy else mid * (1 - SLIPPAGE)
-    return round(float(f"{px:.5g}"), 6 - sz_decimals)
-
-
 def order_size(usd: float, mid: float, sz_decimals: int) -> float:
     """The coin size for `usd` at `mid`, rounded down to the coin's step."""
     step = 10**sz_decimals
@@ -159,11 +154,13 @@ def privy_body(typed: dict) -> dict:
     }
 
 
-def action_header(action: dict, nonce: int) -> str:
-    """The x-hyperliquid-action header: the action as the `/exchange` body
+def payload_header(action: dict, nonce: int, vault: str | None = None, expires_after: int | None = None) -> str:
+    """The x-signed-payload header: the action as the `/exchange` body
     carries it, without the signature, JSON in base64. Key order matters for
     the hash, and json.dumps keeps it."""
-    shown = {"action": action, "nonce": nonce, "vaultAddress": None}
+    shown = {"action": action, "nonce": nonce, "vaultAddress": vault}
+    if expires_after is not None:
+        shown["expiresAfter"] = expires_after
     return base64.b64encode(json.dumps(shown).encode()).decode()
 
 
@@ -178,10 +175,10 @@ def split_signature(sig: str) -> dict:
     return {"r": "0x" + raw[:32].hex(), "s": "0x" + raw[32:64].hex(), "v": v}
 
 
-def privy(args: list[str], stdin: str | None = None, hyperliquid_action: str | None = None) -> str:
+def privy(args: list[str], stdin: str | None = None, signed_payload: str | None = None) -> str:
     env = privy_env()
-    if hyperliquid_action:
-        env["PRIVY_HYPERLIQUID_ACTION"] = hyperliquid_action  # sent as a header (privy_host.cjs)
+    if signed_payload:
+        env["PRIVY_SIGNED_PAYLOAD"] = signed_payload  # sent as a header (privy_host.cjs)
     proc = subprocess.run(
         [PRIVY_CLI, *args], input=stdin, capture_output=True, text=True, timeout=60, env=env
     )
@@ -234,17 +231,56 @@ def ask_mandate(action_id: str, parameters: dict) -> tuple[bool, str]:
     return False, "refused by the mandate: " + ", ".join(answer.get("reason_codes") or ["no reason given"])
 
 
+class Refused(Exception):
+    """Not signed: the mandate refused, or the wallet did not sign."""
+
+
+class RemoteSigner:
+    """The wallet the SDK's Exchange is given. The key is in Privy, never
+    here: the SDK reads only `.address`, and it signs every L1 action through
+    `hyperliquid.exchange.sign_l1_action`, which `place` points at
+    `sign_l1_action` below. Anything signed another way (withdrawals,
+    transfers) comes to `sign_message`, and is refused."""
+
+    def __init__(self, address: str, coin_of_asset: dict[int, str]):
+        self.address = address
+        self.coin_of_asset = coin_of_asset
+        self.why = ""
+
+    def sign_message(self, *_args, **_kwargs):
+        raise Refused("only orders are signed for this agent")
+
+    def sign_l1_action(self, wallet, action, active_pool, nonce, expires_after, is_mainnet):
+        from hyperliquid.utils.signing import action_hash, construct_phantom_agent, l1_payload
+
+        orders = action.get("orders") or []
+        if wallet is not self or action.get("type") != "order" or len(orders) != 1:
+            raise Refused("only one order at a time is signed for this agent")
+        wire = orders[0]
+        coin = self.coin_of_asset.get(wire["a"])
+        if coin is None:
+            raise Refused(f"asset {wire['a']} is not a perpetual")
+        side = "buy" if wire["b"] else "sell"
+        allowed, why = ask_mandate(f"hl-{nonce}", mandate_parameters(coin, side, wire["p"], wire["s"]))
+        if not allowed:
+            raise Refused(why)
+        self.why = why
+        typed = l1_payload(construct_phantom_agent(action_hash(action, active_pool, nonce, expires_after), is_mainnet))
+        typed["message"]["connectionId"] = "0x" + typed["message"]["connectionId"].hex()
+        answer = json.loads(privy(
+            ["rpc"], stdin=json.dumps(privy_body(typed)),
+            signed_payload=payload_header(action, nonce, active_pool, expires_after),
+        ))
+        sig = (answer.get("data") or {}).get("signature") or answer.get("signature")
+        if not sig:
+            raise Refused("Privy returned no signature")
+        return split_signature(sig)
+
+
 def place(ticker: str, rating: str, usd: float) -> dict:
-    from hyperliquid.api import API
+    import hyperliquid.exchange as sdk_exchange
+    from hyperliquid.exchange import Exchange
     from hyperliquid.info import Info
-    from hyperliquid.utils.signing import (
-        action_hash,
-        construct_phantom_agent,
-        get_timestamp_ms,
-        l1_payload,
-        order_request_to_order_wire,
-        order_wires_to_order_action,
-    )
 
     coin, side = coin_of(ticker), side_of(rating)
     if coin is None:
@@ -252,58 +288,40 @@ def place(ticker: str, rating: str, usd: float) -> dict:
     if side is None:
         return {"ok": True, "message": f"no order: the rating is {rating or 'unknown'}"}
     info = Info(BASE_URL, skip_ws=True)
-    universe = info.meta()["universe"]
-    index = next((i for i, a in enumerate(universe) if a["name"] == coin and not a.get("isDelisted")), None)
-    if index is None:
+    meta = info.meta()
+    universe = meta["universe"]
+    asset = next((a for a in universe if a["name"] == coin and not a.get("isDelisted")), None)
+    if asset is None:
         return {"ok": False, "message": f"{coin} has no perpetual on Hyperliquid"}
-    sz_decimals = universe[index]["szDecimals"]
-    mid = float(info.all_mids()[coin])
-    is_buy = side == "buy"
-    if is_buy:
-        size = order_size(usd, mid, sz_decimals)
-        reduce_only = False
-    else:
-        positions = info.user_state(trading_account()).get("assetPositions", [])
-        held = next((float(p["position"]["szi"]) for p in positions if p["position"]["coin"] == coin), 0.0)
-        if held <= 0:
-            return {"ok": True, "message": f"no order: Sell, but there is no {coin} long to close (shorts are not opened)"}
-        size, reduce_only = held, True
-    if size <= 0:
-        return {"ok": False, "message": f"${usd:g} is less than one {coin} size step at {mid:g}"}
-    order = {
-        "coin": coin, "is_buy": is_buy, "sz": size,
-        "limit_px": limit_price(mid, is_buy, sz_decimals),
-        "order_type": {"limit": {"tif": "Ioc"}}, "reduce_only": reduce_only,
-    }
-    action = order_wires_to_order_action([order_request_to_order_wire(order, index)])
-    wire = action["orders"][0]
-    nonce = get_timestamp_ms()
-
-    allowed, why = ask_mandate(f"hl-{nonce}", mandate_parameters(coin, side, wire["p"], wire["s"]))
-    if not allowed:
-        return {"ok": False, "message": why}
-
-    typed = l1_payload(construct_phantom_agent(action_hash(action, None, nonce, None), MAINNET))
-    typed["message"]["connectionId"] = "0x" + typed["message"]["connectionId"].hex()
-    answer = json.loads(privy(
-        ["rpc"], stdin=json.dumps(privy_body(typed)), hyperliquid_action=action_header(action, nonce)
-    ))
-    sig = (answer.get("data") or {}).get("signature") or answer.get("signature")
-    if not sig:
-        return {"ok": False, "message": "Privy returned no signature"}
-    sent = API(BASE_URL).post("/exchange", {
-        "action": action, "nonce": nonce, "signature": split_signature(sig),
-        "vaultAddress": None, "expiresAfter": None,
-    })
-    statuses = ((sent.get("response") or {}).get("data") or {}).get("statuses") or []
-    if sent.get("status") != "ok" or not statuses or "error" in statuses[0]:
-        detail = statuses[0].get("error") if statuses else sent.get("response")
+    signer = RemoteSigner(wallet_address(), {i: a["name"] for i, a in enumerate(universe)})
+    exchange = Exchange(signer, BASE_URL, meta=meta, account_address=ACCOUNT or None)
+    signing, sdk_exchange.sign_l1_action = sdk_exchange.sign_l1_action, signer.sign_l1_action
+    try:
+        if side == "buy":
+            mid = float(info.all_mids()[coin])
+            size = order_size(usd, mid, asset["szDecimals"])
+            if size <= 0:
+                return {"ok": False, "message": f"${usd:g} is less than one {coin} size step at {mid:g}"}
+            sent = exchange.market_open(coin, True, size, None, SLIPPAGE)
+        else:
+            positions = info.user_state(trading_account()).get("assetPositions", [])
+            held = next((float(p["position"]["szi"]) for p in positions if p["position"]["coin"] == coin), 0.0)
+            if held <= 0:
+                return {"ok": True, "message": f"no order: Sell, but there is no {coin} long to close (shorts are not opened)"}
+            sent = exchange.market_close(coin, None, None, SLIPPAGE)
+    except Refused as e:
+        return {"ok": False, "message": str(e)}
+    finally:
+        sdk_exchange.sign_l1_action = signing
+    statuses = (((sent or {}).get("response") or {}).get("data") or {}).get("statuses") or []
+    if (sent or {}).get("status") != "ok" or not statuses or "error" in statuses[0]:
+        detail = statuses[0].get("error") if statuses else (sent or {}).get("response")
         return {"ok": False, "message": f"Hyperliquid did not fill the order: {detail}"}
-    verb = "bought" if is_buy else "sold"
+    verb = "bought" if side == "buy" else "sold"
     filled = statuses[0].get("filled") or {}
     return {
         "ok": True,
-        "message": f"{verb} {filled.get('totalSz', wire['s'])} {coin} at {filled.get('avgPx', wire['p'])} (limit {wire['p']}, {why})",
+        "message": f"{verb} {filled.get('totalSz', '?')} {coin} at {filled.get('avgPx', '?')} ({signer.why})",
     }
 
 

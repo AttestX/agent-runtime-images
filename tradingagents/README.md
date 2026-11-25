@@ -61,17 +61,22 @@ venv (`/opt/hl`).
 | `TA_HL_ACCOUNT` | The Hyperliquid account traded for, e.g. your MetaMask address. Approve the Privy wallet as an API wallet of it first (Hyperliquid app → More → API); it then signs orders for that account and cannot withdraw. Default: the Privy wallet's own account |
 | `TA_HL_NETWORK` | `testnet` trades on Hyperliquid's testnet and signs as testnet; default mainnet |
 
-An order is:
+An order is built by the official SDK (`hyperliquid-python-sdk`'s `Exchange`: `market_open`, and
+`market_close` for a Sell). The SDK signs with a local key, but the key is in Privy, so the SDK is
+given a remote signer (`RemoteSigner` in `shim/hl_trade.py`) and signs every order through it.
+Each order is then:
 
 1. **asked of the owner's ClawUp mandate** (for example `trade-limit`), as trusted-rail's
-   Hyperliquid adapter would type it, and placed only on `allow`;
+   Hyperliquid adapter would type it, and signed only on `allow`;
 2. **signed by the owner's Privy wallet** through the Privy agent-wallet CLI. Privy holds the
    key. Hyperliquid has only a hash of the action signed, so the signing request carries the
-   action itself, in an `x-hyperliquid-action` header (Privy refuses unknown body fields, and
+   action itself, in an `x-signed-payload` header (Privy refuses unknown body fields, and
    its request signature covers only the body; `shim/privy_host.cjs` adds the header to the
    CLI's RPC call). A proxy running trusted-rail checks that the action
    hashes to what is signed, then decides it;
-3. **posted** to `https://api.hyperliquid.xyz/exchange`.
+3. **posted** to `https://api.hyperliquid.xyz/exchange` by the SDK.
+
+Anything else the SDK would sign (withdrawals, transfers) is refused by the signer.
 
 The wallet is connected from chat: `connect wallet` (or `连接钱包`) shows a Privy URL and code to
 approve, `wallet` shows the address and what the agent will do, `disconnect wallet` signs out.

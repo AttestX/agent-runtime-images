@@ -13,19 +13,19 @@ if (id) {
   require("module").syncBuiltinESMExports();
 }
 
-// 2. Hyperliquid has only a hash of an action signed, so a request to sign one
-// carries the action itself, for the proxy to check (trusted-rail). Privy
+// 2. Some typed data holds only a hash (a Hyperliquid action), so a request to
+// sign it carries what it hashes, for the proxy to check (trusted-rail). Privy
 // refuses unknown fields in the RPC body, and its request signature covers
-// only the body and the app id header, so the action goes in a header of its
-// own on the wallet RPC call: x-hyperliquid-action, the action's JSON, base64.
-const action = process.env.PRIVY_HYPERLIQUID_ACTION;
+// only the body and the app id header, so the payload goes in a header of its
+// own on the wallet RPC call: x-signed-payload, the payload's JSON, base64.
+const action = process.env.PRIVY_SIGNED_PAYLOAD;
 if (action && typeof globalThis.fetch === "function") {
   const send = globalThis.fetch;
   globalThis.fetch = (input, init) => {
     const url = typeof input === "string" ? input : (input && input.url) || String(input);
     if (/\/wallets\/[^/]+\/rpc$/.test(new URL(url).pathname)) {
       const headers = new Headers((init && init.headers) || {});
-      headers.set("x-hyperliquid-action", action);
+      headers.set("x-signed-payload", action);
       init = { ...(init || {}), headers };
     }
     return send(input, init);

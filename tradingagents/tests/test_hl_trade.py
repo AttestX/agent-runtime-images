@@ -38,12 +38,6 @@ class Ratings(unittest.TestCase):
 
 
 class Orders(unittest.TestCase):
-    def test_prices_as_the_sdk_prices_a_market_order(self):
-        # 5% through, five significant figures, 6 - szDecimals decimals.
-        self.assertEqual(t.limit_price(97000.5, True, 5), 101850.0)
-        self.assertEqual(t.limit_price(97000.5, False, 5), 92150.0)
-        self.assertEqual(t.limit_price(1.23456, True, 0), 1.2963)
-
     def test_size_rounds_down_to_the_step(self):
         self.assertEqual(t.order_size(100, 97000.5, 5), 0.00103)
         self.assertEqual(t.order_size(5, 97000.5, 3), 0.0)
@@ -88,12 +82,14 @@ class Orders(unittest.TestCase):
         self.assertEqual(body["method"], "eth_signTypedData_v4")
         self.assertEqual(body["params"]["typed_data"]["primary_type"], "Agent")
 
-    def test_the_action_header_keeps_the_key_order(self):
+    def test_the_payload_header_keeps_the_key_order(self):
         import base64
         action = {"type": "order", "orders": [{"a": 0, "b": True, "p": "1", "s": "1", "r": False,
                                                "t": {"limit": {"tif": "Ioc"}}}], "grouping": "na"}
-        shown = json.loads(base64.b64decode(t.action_header(action, 7)))
+        shown = json.loads(base64.b64decode(t.payload_header(action, 7)))
         self.assertEqual(shown, {"action": action, "nonce": 7, "vaultAddress": None})
+        timed = json.loads(base64.b64decode(t.payload_header(action, 7, None, 99)))
+        self.assertEqual(timed["expiresAfter"], 99)
         self.assertEqual(list(shown["action"]), ["type", "orders", "grouping"])
         self.assertEqual(list(shown["action"]["orders"][0]), ["a", "b", "p", "s", "r", "t"])
 
@@ -231,3 +227,82 @@ class AfterAnalysis(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+try:
+    import hyperliquid  # noqa: F401
+    HAVE_SDK = True
+except ImportError:
+    HAVE_SDK = False
+
+
+@unittest.skipUnless(HAVE_SDK, "needs hyperliquid-python-sdk (run with /opt/hl/bin/python)")
+class SignsForTheSdk(unittest.TestCase):
+    """The SDK's Exchange signs through RemoteSigner: the mandate is asked,
+    then Privy, with the action in the header; nothing else is signed."""
+
+    # A buy of 0.0125 BTC at 97000.5, and its connectionId (SDK 0.24.1).
+    ACTION = {"type": "order", "orders": [{"a": 0, "b": True, "p": "97000.5", "s": "0.0125", "r": False,
+                                           "t": {"limit": {"tif": "Gtc"}}}], "grouping": "na"}
+    NONCE = 1732000000000
+    HASH = "0xb2c52a2c3da723ee415cf4b41740dae1eefa8587e2051c1e6997d4c7304b3a13"
+
+    def setUp(self):
+        self.asked, self.sent = [], []
+        self.saved = (t.ask_mandate, t.privy)
+        t.ask_mandate = lambda action_id, params: (self.asked.append((action_id, params)) or self.answer)
+        t.privy = lambda args, stdin=None, signed_payload=None: (
+            self.sent.append((json.loads(stdin), signed_payload)) or json.dumps({"data": {"signature": "0x" + "11" * 64 + "1b"}}))
+        self.answer = (True, "allowed")
+        self.signer = t.RemoteSigner("0x" + "ab" * 20, {0: "BTC"})
+
+    def tearDown(self):
+        t.ask_mandate, t.privy = self.saved
+
+    def test_an_order_is_asked_then_signed_with_its_action(self):
+        import base64
+        sig = self.signer.sign_l1_action(self.signer, self.ACTION, None, self.NONCE, None, True)
+        self.assertEqual(sig["v"], 27)
+        (action_id, params), = self.asked
+        self.assertEqual(action_id, f"hl-{self.NONCE}")
+        self.assertEqual(params, t.mandate_parameters("BTC", "buy", "97000.5", "0.0125"))
+        (body, header), = self.sent
+        self.assertEqual(body["params"]["typed_data"]["message"], {"source": "a", "connectionId": self.HASH})
+        self.assertEqual(json.loads(base64.b64decode(header)),
+                         {"action": self.ACTION, "nonce": self.NONCE, "vaultAddress": None})
+
+    def test_refused_by_the_mandate_nothing_is_signed(self):
+        self.answer = (False, "over the daily limit")
+        with self.assertRaisesRegex(t.Refused, "daily limit"):
+            self.signer.sign_l1_action(self.signer, self.ACTION, None, self.NONCE, None, True)
+        self.assertEqual(self.sent, [])
+
+    def test_only_one_order_is_signed(self):
+        for action in ({"type": "cancel", "cancels": []},
+                       {**self.ACTION, "orders": self.ACTION["orders"] * 2},
+                       {**self.ACTION, "orders": [{**self.ACTION["orders"][0], "a": 7}]}):
+            with self.assertRaises(t.Refused):
+                self.signer.sign_l1_action(self.signer, action, None, self.NONCE, None, True)
+        # A withdrawal or transfer comes to sign_message.
+        with self.assertRaises(t.Refused):
+            self.signer.sign_message(object())
+        self.assertEqual(self.sent, [])
+
+    def test_the_sdk_signs_through_the_signer(self):
+        # The SDK's own order path, without the network: _post_action is
+        # stubbed, so what it would post is what is checked.
+        import hyperliquid.exchange as sdk
+        meta = {"universe": [{"name": "BTC", "szDecimals": 5, "maxLeverage": 40}]}
+        spot = {"universe": [], "tokens": []}
+        ex = sdk.Exchange(self.signer, "https://api.hyperliquid.xyz", meta=meta, spot_meta=spot, perp_dexs=[""])
+        posted = []
+        ex._post_action = lambda action, signature, nonce: posted.append((action, signature)) or {"status": "ok"}
+        saved, sdk.sign_l1_action = sdk.sign_l1_action, self.signer.sign_l1_action
+        try:
+            ex.order("BTC", True, 0.0125, 97000.5, {"limit": {"tif": "Gtc"}})
+        finally:
+            sdk.sign_l1_action = saved
+        (action, signature), = posted
+        self.assertEqual(action["orders"][0]["p"], "97000.5")
+        self.assertEqual(signature["v"], 27)
+        self.assertEqual(len(self.asked), 1)
