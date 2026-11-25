@@ -57,6 +57,17 @@ class Orders(unittest.TestCase):
             "rail": "hyperliquid", "side": "buy", "symbol": "btc", "venue": "api.hyperliquid.xyz",
         })
 
+    def test_the_account_traded_for(self):
+        old = t.ACCOUNT
+        try:
+            t.ACCOUNT = "0x00000000000000000000000000000000000000Aa"
+            self.assertEqual(t.trading_account(), "0x00000000000000000000000000000000000000Aa")
+            t.ACCOUNT = "not-an-address"
+            with self.assertRaises(RuntimeError):
+                t.trading_account()
+        finally:
+            t.ACCOUNT = old
+
     def test_testnet_is_a_switch(self):
         import subprocess
         code = "import hl_trade as t; print(t.MAINNET, t.EXCHANGE_HOST)"

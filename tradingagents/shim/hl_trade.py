@@ -51,6 +51,11 @@ PRIVY_CLI = os.environ.get("PRIVY_CLI") or (
 )
 CLAWUP_API_URL = os.environ.get("CLAWUP_API_URL", "https://api.clawup.org").rstrip("/")
 CRYPTO_QUOTES = ("-USD", "-USDT", "-USDC")
+# The Hyperliquid account traded for. Empty: the Privy wallet's own account.
+# Set to the owner's own address (MetaMask, ...) after approving the Privy
+# wallet as an API wallet of it in Hyperliquid: the Privy wallet then signs
+# orders for that account, and cannot withdraw or transfer from it.
+ACCOUNT = os.environ.get("TA_HL_ACCOUNT", "").strip()
 STATE_DIR = os.environ.get("TA_STATE_DIR") or os.path.join(os.path.expanduser("~"), ".tradingagents")
 WALLET_HOME = os.path.join(STATE_DIR, "wallet")
 HOST_PRELOAD = os.path.join(os.path.dirname(os.path.abspath(__file__)), "privy_host.cjs")
@@ -193,6 +198,15 @@ def wallet_address() -> str:
     return m.group(1)
 
 
+def trading_account() -> str:
+    """The account whose positions are read: TA_HL_ACCOUNT, or the wallet's own."""
+    if ACCOUNT:
+        if not re.fullmatch(r"0x[0-9a-fA-F]{40}", ACCOUNT):
+            raise RuntimeError("TA_HL_ACCOUNT is not an address")
+        return ACCOUNT
+    return wallet_address()
+
+
 def ask_mandate(action_id: str, parameters: dict) -> tuple[bool, str]:
     key = os.environ.get("CLAWUP_API_KEY", "")
     mandate = os.environ.get("CLAWUP_MANDATE", "")
@@ -249,8 +263,7 @@ def place(ticker: str, rating: str, usd: float) -> dict:
         size = order_size(usd, mid, sz_decimals)
         reduce_only = False
     else:
-        address = wallet_address()
-        positions = info.user_state(address).get("assetPositions", [])
+        positions = info.user_state(trading_account()).get("assetPositions", [])
         held = next((float(p["position"]["szi"]) for p in positions if p["position"]["coin"] == coin), 0.0)
         if held <= 0:
             return {"ok": True, "message": f"no order: Sell, but there is no {coin} long to close (shorts are not opened)"}
@@ -305,7 +318,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         if args.command == "wallet":
-            result = {"ok": True, "address": wallet_address()}
+            result = {"ok": True, "address": wallet_address(), "account": trading_account()}
         else:
             result = place(args.ticker, args.rating, args.usd)
     except Exception as e:  # one JSON line, whatever happens

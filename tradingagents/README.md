@@ -58,6 +58,7 @@ venv (`/opt/hl`).
 | `TA_TRADE_ORDER_USD` | The size of a buy, in US dollars |
 | `CLAWUP_MANDATE`, `CLAWUP_API_KEY` | The ClawUp mandate each order is asked of, and a `cu_` key with `mandates:decide`. Without them nothing is traded |
 | `CLAWUP_API_URL` | Default `https://api.clawup.org` |
+| `TA_HL_ACCOUNT` | The Hyperliquid account traded for, e.g. your MetaMask address. Approve the Privy wallet as an API wallet of it first (Hyperliquid app → More → API); it then signs orders for that account and cannot withdraw. Default: the Privy wallet's own account |
 | `TA_HL_NETWORK` | `testnet` trades on Hyperliquid's testnet and signs as testnet; default mainnet |
 
 An order is:

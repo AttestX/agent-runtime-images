@@ -724,7 +724,15 @@ def wallet_reply(command: str) -> str:
             "Hyperliquid; after a Sell it closes the long. Each order is first asked of your "
             "ClawUp mandate."
         )
-    return f"Wallet: {address} (Privy). {trading}"
+    account = hl_trade.ACCOUNT
+    if account and account.lower() != address.lower():
+        trades_for = (
+            f" It trades for the Hyperliquid account {account}, which must have approved "
+            f"{address} as an API wallet."
+        )
+    else:
+        trades_for = " It trades for its own Hyperliquid account."
+    return f"Wallet: {address} (Privy).{trades_for} {trading}"
 
 
 def _start_proc(run: Run) -> None:
