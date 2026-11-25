@@ -14,7 +14,7 @@ Upstream publishes no registry image, so it is built here:
 # from a clone of this repo):
 docker build \
   --build-arg TA_VERSION=v0.7.1 \
-  -t clawup/tradingagents:0.7.1-shim4 \
+  -t clawup/tradingagents:0.7.1-shim5 \
   -f Dockerfile .
 
 # GHCR publish: merge to main or dispatch publish-runtime-image (see repo workflow)
@@ -56,33 +56,27 @@ venv (`/opt/hl`).
 |---|---|
 | `TA_TRADE_HYPERLIQUID` | `1` turns trading on |
 | `TA_TRADE_ORDER_USD` | The size of a buy, in US dollars |
-| `CLAWUP_MANDATE`, `CLAWUP_API_KEY` | The ClawUp mandate each order is asked of, and a `cu_` key with `mandates:decide`. Without them nothing is traded |
-| `CLAWUP_API_URL` | Default `https://api.clawup.org` |
-| `TA_HL_ACCOUNT` | The Hyperliquid account traded for, e.g. your MetaMask address. Approve the Privy wallet as an API wallet of it first (Hyperliquid app → More → API); it then signs orders for that account and cannot withdraw. Default: the Privy wallet's own account |
-| `TA_HL_NETWORK` | `testnet` trades on Hyperliquid's testnet and signs as testnet; default mainnet |
+| `CLAWUP_API_URL` | Where the agent asks ClawUp to sign. Default `https://api.clawup.org` |
+| `TA_HL_ACCOUNT` | The Hyperliquid account traded for, e.g. your MetaMask address. Approve the agent's wallet as an API wallet of it first (Hyperliquid app → More → API); it then signs orders for that account and cannot withdraw. Default: the agent's wallet's own account |
+
+No key is in the image. ClawUp keeps a server wallet for each agent (opened on the agent's page
+in the console, where the owner sends USDC to it on Hyperliquid), and signs for it only what
+every mandate bound to the agent allows.
 
 An order is built by the official SDK (`hyperliquid-python-sdk`'s `Exchange`: `market_open`, and
-`market_close` for a Sell). The SDK signs with a local key, but the key is in Privy, so the SDK is
-given a remote signer (`RemoteSigner` in `shim/hl_trade.py`) and signs every order through it.
-Each order is then:
+`market_close` for a Sell). The SDK signs with a local key, so it is given a remote signer
+(`RemoteSigner` in `shim/hl_trade.py`) and signs every order through it. Each order is:
 
-1. **asked of the owner's ClawUp mandate** (for example `trade-limit`), as trusted-rail's
-   Hyperliquid adapter would type it, and signed only on `allow`;
-2. **signed by the owner's Privy wallet** through the Privy agent-wallet CLI. Privy holds the
-   key. Hyperliquid has only a hash of the action signed, so the signing request carries the
-   action itself, in an `x-signed-payload` header (Privy refuses unknown body fields, and
-   its request signature covers only the body; `shim/privy_host.cjs` adds the header to the
-   CLI's RPC call). A proxy running trusted-rail checks that the action
-   hashes to what is signed, then decides it;
-3. **posted** to `https://api.hyperliquid.xyz/exchange` by the SDK.
+1. **sent to ClawUp to sign** (`POST /api/v1/runtime/wallet/sign`, with the agent's gateway
+   token). Hyperliquid has only a hash of the action signed, so the request carries the action
+   itself. ClawUp checks with trusted-rail that it hashes to what is signed and types it as the
+   order it is, asks every mandate bound to the agent, and signs only if all of them allow it.
+   The agent asks no mandate itself, so an order counts once;
+2. **posted** to `https://api.hyperliquid.xyz/exchange` by the SDK.
 
-Anything else the SDK would sign (withdrawals, transfers) is refused by the signer.
-
-The wallet is connected from chat: `connect wallet` (or `连接钱包`) shows a Privy URL and code to
-approve, `wallet` shows the address and what the agent will do, `disconnect wallet` signs out.
-The Privy session lives in the state dir (`wallet/`), so it is backed up and restored with the
-agent. The CLI encrypts it with a key derived from the hostname, which changes when a container
-is recreated, so `shim/privy_host.cjs` gives the CLI this agent's own id as its hostname instead.
+Anything else the SDK would sign (withdrawals, transfers) is refused by the signer, and by
+ClawUp. Testnet is not traded: trusted-rail refuses testnet actions, since testnet numbers its
+assets differently. `wallet` (or `钱包`) in chat shows the agent's wallet and what it will do.
 
 ## Local e2e (no real LLM key needed)
 
@@ -98,7 +92,7 @@ docker run -d --name ta-e2e \
   -e OPENCLAW_STATE_DIR=/home/appuser/.tradingagents \
   -e OPENCLAW_GATEWAY_TOKEN=e2e-token -e MOCK_KEY=mock-key \
   -p 127.0.0.1:18788:18789 \
-  clawup/tradingagents:0.7.1-shim4 \
+  clawup/tradingagents:0.7.1-shim5 \
   sh -lc "TA_MODE='compatible' TA_LLM_PROVIDER='' TA_QUICK_MODEL='mock-model' \
 TA_DEEP_MODEL='mock-model' TA_BACKEND_URL='http://host.docker.internal:9999/v1' \
 TA_API_KEY_ENV='MOCK_KEY' TA_API_KEY_RAW=\"\${MOCK_KEY:-}\" \

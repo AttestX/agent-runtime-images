@@ -8,18 +8,15 @@ At most one order per finished analysis, on the coin's perpetual:
 
 Orders are the official SDK's (hyperliquid-python-sdk's Exchange:
 market_open and market_close, IOC limits 5% through the mid), so their value
-is stated: price times size. The SDK signs with a local key; here the key is
-in Privy, so the SDK is given a RemoteSigner instead. Every order the SDK
-signs goes through it, and is, in this order:
-  1. asked of the owner's ClawUp mandate (CLAWUP_MANDATE, with CLAWUP_API_KEY):
-     signed only on a signed "allow", with the parameters trusted-rail's
-     Hyperliquid adapter states for the same order. No mandate, no trading;
-  2. signed by the owner's Privy wallet, through the Privy agent-wallet CLI.
-     Hyperliquid has only a hash of the action signed, so the request carries
-     the action itself (header `x-signed-payload`): the proxy can then check
-     that it hashes to what is signed, and decide it (trusted-rail);
-then the SDK posts it to Hyperliquid's /exchange. Anything else the SDK would
-sign (withdrawals, transfers) is refused by the signer.
+is stated: price times size. The SDK signs with a local key; this agent holds
+none. Its wallet is a server wallet ClawUp keeps for it, and the SDK is given
+a RemoteSigner that asks ClawUp to sign (POST /api/v1/runtime/wallet/sign,
+with the agent's gateway token). Hyperliquid has only a hash of the action
+signed, so the request carries the action itself; ClawUp checks that it
+hashes to what is signed, asks every mandate bound to the agent, and signs
+only if all of them allow it. Then the SDK posts it to /exchange. Anything
+else the SDK would sign (withdrawals, transfers) is refused by the signer, and
+by ClawUp.
 
 Runs in its own venv with the SDK (/opt/hl); the shim calls
 `python hl_trade.py <command> ...` and reads one JSON object from stdout.
@@ -34,56 +31,24 @@ import json
 import math
 import os
 import re
-import subprocess
 import sys
 import urllib.error
 import urllib.request
-from decimal import ROUND_CEILING, Decimal
 
-# TA_HL_NETWORK=testnet trades on Hyperliquid's testnet (free test USDC) and
-# signs as testnet; anything else is mainnet.
-MAINNET = os.environ.get("TA_HL_NETWORK", "mainnet").strip().lower() != "testnet"
-EXCHANGE_HOST = "api.hyperliquid.xyz" if MAINNET else "api.hyperliquid-testnet.xyz"
+EXCHANGE_HOST = "api.hyperliquid.xyz"
 BASE_URL = f"https://{EXCHANGE_HOST}"
 SLIPPAGE = 0.05
-# Absolute by default: the provisioner sets the container's PATH itself.
-_PRIVY_IN_IMAGE = "/opt/privy/bin/privy-agent-wallet"
-PRIVY_CLI = os.environ.get("PRIVY_CLI") or (
-    _PRIVY_IN_IMAGE if os.path.exists(_PRIVY_IN_IMAGE) else "privy-agent-wallet"
-)
 CLAWUP_API_URL = os.environ.get("CLAWUP_API_URL", "https://api.clawup.org").rstrip("/")
 CRYPTO_QUOTES = ("-USD", "-USDT", "-USDC")
-# The Hyperliquid account traded for. Empty: the Privy wallet's own account.
-# Set to the owner's own address (MetaMask, ...) after approving the Privy
-# wallet as an API wallet of it in Hyperliquid: the Privy wallet then signs
+# The Hyperliquid account traded for. Empty: the agent's wallet's own account
+# (the owner deposits into it). Or the owner's own address, after approving
+# the agent's wallet as an API wallet of it in Hyperliquid: it then signs
 # orders for that account, and cannot withdraw or transfer from it.
 ACCOUNT = os.environ.get("TA_HL_ACCOUNT", "").strip()
-STATE_DIR = os.environ.get("TA_STATE_DIR") or os.path.join(os.path.expanduser("~"), ".tradingagents")
-WALLET_HOME = os.path.join(STATE_DIR, "wallet")
-HOST_PRELOAD = os.path.join(os.path.dirname(os.path.abspath(__file__)), "privy_host.cjs")
 
 
-def privy_env() -> dict:
-    """The Privy CLI's environment: its session (~/.privy) lives in the state
-    dir, so it is backed up and restored with the agent, and is encrypted
-    under this agent's own id rather than the container's hostname."""
-    os.makedirs(WALLET_HOME, mode=0o700, exist_ok=True)
-    id_path = os.path.join(WALLET_HOME, "host-id")
-    try:
-        with open(id_path) as f:
-            host = f.read().strip()
-    except FileNotFoundError:
-        host = ""
-    if not host:
-        host = "ta-" + os.urandom(16).hex()
-        fd = os.open(id_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w") as f:
-            f.write(host)
-    env = dict(os.environ)
-    env["HOME"] = WALLET_HOME
-    env["PRIVY_SESSION_HOST"] = host
-    env["NODE_OPTIONS"] = (env.get("NODE_OPTIONS", "") + f" --require {HOST_PRELOAD}").strip()
-    return env
+class Refused(Exception):
+    """Not signed: a mandate refused, or ClawUp did not sign."""
 
 
 def coin_of(ticker: str) -> str | None:
@@ -113,49 +78,8 @@ def order_size(usd: float, mid: float, sz_decimals: int) -> float:
     return math.floor(usd / mid * step) / step
 
 
-def amount_micro(price_wire: str, size_wire: str) -> int:
-    """Price times size in millionths, rounded up: as trusted-rail states it."""
-    value = Decimal(price_wire) * Decimal(size_wire) * 1_000_000
-    return int(value.to_integral_value(rounding=ROUND_CEILING))
-
-
-def micro(text: str) -> int:
-    return int((Decimal(text) * 1_000_000).to_integral_value(rounding=ROUND_CEILING))
-
-
-def mandate_parameters(coin: str, side: str, price_wire: str, size_wire: str) -> dict:
-    """What trusted-rail's exchange/hyperliquid.json writes for this order."""
-    return {
-        "symbol": coin.lower(),
-        "side": side,
-        "order_type": "limit",
-        "amount_micro": amount_micro(price_wire, size_wire),
-        "quantity_micro": micro(size_wire),
-        "limit_price_micro": micro(price_wire),
-        "currency": "usdc",
-        "account": "main",
-        "venue": EXCHANGE_HOST,
-        "rail": "hyperliquid",
-    }
-
-
-def privy_body(typed: dict) -> dict:
-    """The Privy RPC body: sign the typed data. Privy refuses any other field."""
-    return {
-        "method": "eth_signTypedData_v4",
-        "params": {
-            "typed_data": {
-                "domain": typed["domain"],
-                "types": typed["types"],
-                "primary_type": typed["primaryType"],
-                "message": typed["message"],
-            }
-        },
-    }
-
-
-def payload_header(action: dict, nonce: int, vault: str | None = None, expires_after: int | None = None) -> str:
-    """The x-signed-payload header: the action as the `/exchange` body
+def payload(action: dict, nonce: int, vault: str | None = None, expires_after: int | None = None) -> str:
+    """What the signature is a hash of: the action as the `/exchange` body
     carries it, without the signature, JSON in base64. Key order matters for
     the hash, and json.dumps keeps it."""
     shown = {"action": action, "nonce": nonce, "vaultAddress": vault}
@@ -175,76 +99,61 @@ def split_signature(sig: str) -> dict:
     return {"r": "0x" + raw[:32].hex(), "s": "0x" + raw[32:64].hex(), "v": v}
 
 
-def privy(args: list[str], stdin: str | None = None, signed_payload: str | None = None) -> str:
-    env = privy_env()
-    if signed_payload:
-        env["PRIVY_SIGNED_PAYLOAD"] = signed_payload  # sent as a header (privy_host.cjs)
-    proc = subprocess.run(
-        [PRIVY_CLI, *args], input=stdin, capture_output=True, text=True, timeout=60, env=env
+def clawup(method: str, path: str, body: dict | None = None) -> dict:
+    """A call to ClawUp as this agent, by its gateway token."""
+    token = os.environ.get("OPENCLAW_GATEWAY_TOKEN", "")
+    if not token:
+        raise Refused("this agent has no gateway token, so ClawUp cannot sign for it")
+    req = urllib.request.Request(
+        f"{CLAWUP_API_URL}{path}",
+        data=None if body is None else json.dumps(body).encode(),
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        method=method,
     )
-    if proc.returncode != 0:
-        raise RuntimeError((proc.stderr or proc.stdout).strip()[-400:] or "the Privy CLI failed")
-    return proc.stdout
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.load(r)
+    except urllib.error.HTTPError as e:
+        try:
+            answer = json.load(e)
+        except ValueError:
+            answer = {}
+        raise Refused(answer.get("message") or f"ClawUp answered {e.code}") from None
+    except (urllib.error.URLError, OSError) as e:
+        raise Refused(f"ClawUp is unreachable: {e}") from None
 
 
 def wallet_address() -> str:
-    out = privy(["list-wallets"])
-    m = re.search(r"ethereum:\s*(0x[0-9a-fA-F]{40})", out)
-    if not m:
-        raise RuntimeError("no Ethereum wallet: connect one first ('connect wallet')")
-    return m.group(1)
+    """The agent's wallet, once its owner has opened it in the console."""
+    address = clawup("GET", "/api/v1/runtime/wallet").get("address", "")
+    if not re.fullmatch(r"0x[0-9a-fA-F]{40}", address):
+        raise Refused("ClawUp answered without a wallet address")
+    return address
 
 
 def trading_account() -> str:
     """The account whose positions are read: TA_HL_ACCOUNT, or the wallet's own."""
     if ACCOUNT:
         if not re.fullmatch(r"0x[0-9a-fA-F]{40}", ACCOUNT):
-            raise RuntimeError("TA_HL_ACCOUNT is not an address")
+            raise Refused("TA_HL_ACCOUNT is not an address")
         return ACCOUNT
     return wallet_address()
 
 
-def ask_mandate(action_id: str, parameters: dict) -> tuple[bool, str]:
-    key = os.environ.get("CLAWUP_API_KEY", "")
-    mandate = os.environ.get("CLAWUP_MANDATE", "")
-    if not key or not mandate:
-        return False, "no ClawUp mandate is configured (CLAWUP_MANDATE, CLAWUP_API_KEY), so nothing is traded"
-    body = json.dumps({
-        "action_id": action_id,
-        "action": {"operation": "order.place", "resource": parameters["symbol"], "parameters": parameters},
-    }).encode()
-    req = urllib.request.Request(
-        f"{CLAWUP_API_URL}/api/v1/mandates/agents/{urllib.request.quote(mandate, safe='')}/decide",
-        data=body,
-        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=20) as r:
-            answer = json.load(r)
-    except urllib.error.HTTPError as e:
-        return False, f"the mandate check failed (HTTP {e.code})"
-    except (OSError, ValueError) as e:
-        return False, f"the mandate check failed ({e})"
-    if answer.get("decision") == "allow":
-        return True, "allowed by the mandate"
-    return False, "refused by the mandate: " + ", ".join(answer.get("reason_codes") or ["no reason given"])
-
-
-class Refused(Exception):
-    """Not signed: the mandate refused, or the wallet did not sign."""
+def allowed_by(answer: dict) -> str:
+    names = [d.get("mandate") for d in answer.get("decisions") or [] if d.get("mandate")]
+    return "allowed by " + ", ".join(names) if names else "allowed"
 
 
 class RemoteSigner:
-    """The wallet the SDK's Exchange is given. The key is in Privy, never
+    """The wallet the SDK's Exchange is given. The key is ClawUp's, never
     here: the SDK reads only `.address`, and it signs every L1 action through
     `hyperliquid.exchange.sign_l1_action`, which `place` points at
     `sign_l1_action` below. Anything signed another way (withdrawals,
     transfers) comes to `sign_message`, and is refused."""
 
-    def __init__(self, address: str, coin_of_asset: dict[int, str]):
+    def __init__(self, address: str):
         self.address = address
-        self.coin_of_asset = coin_of_asset
         self.why = ""
 
     def sign_message(self, *_args, **_kwargs):
@@ -256,24 +165,16 @@ class RemoteSigner:
         orders = action.get("orders") or []
         if wallet is not self or action.get("type") != "order" or len(orders) != 1:
             raise Refused("only one order at a time is signed for this agent")
-        wire = orders[0]
-        coin = self.coin_of_asset.get(wire["a"])
-        if coin is None:
-            raise Refused(f"asset {wire['a']} is not a perpetual")
-        side = "buy" if wire["b"] else "sell"
-        allowed, why = ask_mandate(f"hl-{nonce}", mandate_parameters(coin, side, wire["p"], wire["s"]))
-        if not allowed:
-            raise Refused(why)
-        self.why = why
         typed = l1_payload(construct_phantom_agent(action_hash(action, active_pool, nonce, expires_after), is_mainnet))
         typed["message"]["connectionId"] = "0x" + typed["message"]["connectionId"].hex()
-        answer = json.loads(privy(
-            ["rpc"], stdin=json.dumps(privy_body(typed)),
-            signed_payload=payload_header(action, nonce, active_pool, expires_after),
-        ))
-        sig = (answer.get("data") or {}).get("signature") or answer.get("signature")
+        answer = clawup("POST", "/api/v1/runtime/wallet/sign", {
+            "typed_data": typed,
+            "payload": payload(action, nonce, active_pool, expires_after),
+        })
+        sig = answer.get("signature")
         if not sig:
-            raise Refused("Privy returned no signature")
+            raise Refused("ClawUp returned no signature")
+        self.why = allowed_by(answer)
         return split_signature(sig)
 
 
@@ -289,11 +190,13 @@ def place(ticker: str, rating: str, usd: float) -> dict:
         return {"ok": True, "message": f"no order: the rating is {rating or 'unknown'}"}
     info = Info(BASE_URL, skip_ws=True)
     meta = info.meta()
-    universe = meta["universe"]
-    asset = next((a for a in universe if a["name"] == coin and not a.get("isDelisted")), None)
+    asset = next((a for a in meta["universe"] if a["name"] == coin and not a.get("isDelisted")), None)
     if asset is None:
         return {"ok": False, "message": f"{coin} has no perpetual on Hyperliquid"}
-    signer = RemoteSigner(wallet_address(), {i: a["name"] for i, a in enumerate(universe)})
+    try:
+        signer = RemoteSigner(wallet_address())
+    except Refused as e:
+        return {"ok": False, "message": str(e)}
     exchange = Exchange(signer, BASE_URL, meta=meta, account_address=ACCOUNT or None)
     signing, sdk_exchange.sign_l1_action = sdk_exchange.sign_l1_action, signer.sign_l1_action
     try:
