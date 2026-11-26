@@ -13,7 +13,7 @@ in this repo. This repo builds the one that needs a ClawUp-baked gateway shim
 |---|---|---|
 | **openclaw** | `ghcr.io/openclaw/openclaw:2026.11.6` (catalog; Compose has a separate fallback) | Upstream open source — pulled directly, not built here |
 | **hermes** | `nousresearch/hermes-agent:v0.23.3` | Upstream open source — pulled directly, not built here |
-| **tradingagents** | `ghcr.io/attestx/tradingagents:0.7.1-shim4` (current catalog); this repo builds `0.7.1-shim5` | **Built here** — `tradingagents/` (upstream v0.7.1 + ClawUp gateway shim) |
+| **tradingagents** | `ghcr.io/attestx/tradingagents:0.7.1-shim5` (current catalog) | **Built here** — `tradingagents/` (upstream v0.7.1 + ClawUp gateway shim) |
 
 The Python gateway adapter here is distinct from the Rust `trusted-shim` node
 service. It does not schedule containers or generate policy proofs.
@@ -61,7 +61,10 @@ The existing BotMesh catalog image remains usable; switch the catalog to the new
 owner/version only after its image is available.
 
 Bumping the upstream pin (Dockerfile `ARG`) or the shim revision
-(workflow `env`) and merging publishes a new reference.
+(workflow `env`) and merging publishes a new reference. **A published
+reference is never overwritten**: a merge that bumps neither publishes only its
+`sha-<commit>` tag and warns. So any change to what the image does needs a
+`SHIM_REVISION` bump, or it is not released under the catalog's reference.
 
 **ClawUp's catalog** (`backend/bot_runtimes.json`,
 `tradingagents.default_image`) must carry the **same reference** — keep
