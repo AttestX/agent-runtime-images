@@ -146,7 +146,7 @@ def allowed_by(answer: dict) -> str:
 
 
 class RemoteSigner:
-    """The wallet the SDK's Exchange is given. The key is ClawUp's, never
+    """The wallet the SDK's Exchange is given. The key is held in Privy, never
     here: the SDK reads only `.address`, and it signs every L1 action through
     `hyperliquid.exchange.sign_l1_action`, which `place` points at
     `sign_l1_action` below. Anything signed another way (withdrawals,
