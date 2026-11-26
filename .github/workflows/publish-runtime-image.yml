@@ -6,6 +6,11 @@
 #   shim revision <- SHIM_REVISION below
 # so bumping either (and merging) publishes a new reference.
 #
+# A published reference is never overwritten: once it exists, a merge that
+# does not bump either only publishes the commit's own sha-<commit> tag (and
+# warns). Change the shim and leave SHIM_REVISION alone, and nothing new is
+# released under the catalog's reference.
+#
 # ClawUp's catalog (backend/bot_runtimes.json, tradingagents.default_image)
 # must carry the SAME reference — keep them in sync when bumping.
 name: publish-runtime-image
@@ -52,12 +57,25 @@ jobs:
           IMAGE: ${{ steps.ref.outputs.image }}
         run: |
           set -euo pipefail
+          # Never move a reference a catalog may already point at.
+          if out=$(docker buildx imagetools inspect "$IMAGE" 2>&1); then
+            exists=1
+          elif grep -qi "not found" <<<"$out"; then
+            exists=0
+          else
+            echo "::error::could not check whether $IMAGE exists: $out"
+            exit 1
+          fi
+          candidate="${IMAGE%:*}:sha-$(git rev-parse HEAD)"
           docker build \
             --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
-            -t "$IMAGE" \
+            -t "$candidate" \
             -f tradingagents/Dockerfile tradingagents
-          docker push "$IMAGE"
-          candidate="${IMAGE%:*}:sha-$(git rev-parse HEAD)"
-          docker tag "$IMAGE" "$candidate"
           docker push "$candidate"
+          if [ "$exists" = 1 ]; then
+            echo "::warning::$IMAGE is already published and is left as it is; bump SHIM_REVISION (or TA_VERSION) to release this build. It is published only as $candidate."
+            exit 0
+          fi
+          docker tag "$candidate" "$IMAGE"
+          docker push "$IMAGE"
           echo "published $IMAGE"
