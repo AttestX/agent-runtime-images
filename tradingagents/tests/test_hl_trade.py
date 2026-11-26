@@ -142,6 +142,19 @@ class TalksToClawUp(ClawUpCase):
         self.assertIn("No wallet yet", shim.wallet_reply("status"))
         self.assertIn("console", shim.wallet_reply("status"))
 
+    def test_a_failure_is_not_called_a_missing_wallet(self):
+        self.clawup.wallet = (401, {"error": "AUTH_401", "message": "Send the agent's gateway token"})
+        with self.assertRaises(t.Refused) as caught:
+            t.wallet_address()
+        self.assertEqual(caught.exception.code, "AUTH_401")
+        reply = shim.wallet_reply("status")
+        self.assertNotIn("No wallet yet", reply)
+        self.assertIn("gateway token", reply)
+        t.CLAWUP_API_URL = "http://127.0.0.1:9"  # nothing listens
+        reply = shim.wallet_reply("status")
+        self.assertNotIn("No wallet yet", reply)
+        self.assertIn("unreachable", reply)
+
     def test_without_a_gateway_token_nothing_is_asked(self):
         del os.environ["OPENCLAW_GATEWAY_TOKEN"]
         with self.assertRaisesRegex(t.Refused, "gateway token"):

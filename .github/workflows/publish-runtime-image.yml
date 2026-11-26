@@ -25,7 +25,7 @@ permissions:
   packages: write
 
 env:
-  SHIM_REVISION: shim6
+  SHIM_REVISION: shim7
 
 jobs:
   tradingagents:

@@ -146,25 +146,47 @@ STOPWORDS = {
     "PLEASE", "WANT", "NEED", "GIVE", "SHOW", "WHAT", "WHICH", "WHEN", "HOW",
     "RUN", "START", "THE", "A", "AN", "USD", "CNY", "HOLD", "BUY", "SELL",
     "TODAY", "YESTERDAY", "DATE", "TIME", "CHECK", "HELP", "STATUS", "ME",
-    "OK", "AND", "FOR", "WITH", "THIS", "THAT", "IT", "IS", "BE", "GO",
+    "OK", "AND", "FOR", "WITH", "THIS", "THAT", "IT", "IS", "BE", "GO", "I", "MY",
 }
 
+# Token edges are ASCII letters and digits only, never \b: in Python's
+# Unicode regexes a CJK character is a word character, so "交易BTC吗" has no
+# \b around BTC and a Chinese question would name no ticker.
+_L = r"(?<![A-Za-z0-9])"
+_R = r"(?![A-Za-z0-9])"
 EXPLICIT_TICKER_RE = re.compile(
-    r"(?:ticker|symbol|代码|股票代码|股票)\s*[:：=]?\s*([A-Za-z][A-Za-z0-9.\-]{0,15})",
+    r"(?:ticker|symbol|代码|股票代码|股票)\s*[:：=]?\s*([A-Za-z][A-Za-z0-9.\-]{0,15})" + _R,
     re.I,
 )
 EXPLICIT_DATE_RE = re.compile(
     r"(?:date|日期|交易日)\s*[:：=]?\s*(\d{4})-(\d{1,2})-(\d{1,2})", re.I
 )
-BARE_DATE_RE = re.compile(r"\b(\d{4})-(\d{1,2})-(\d{1,2})\b")
+BARE_DATE_RE = re.compile(r"(?<!\d)(\d{4})-(\d{1,2})-(\d{1,2})(?!\d)")
 # Exchange-suffixed tickers are unambiguous, so the base may be long
 # (India name-based NSE/BSE tickers: RELIANCE.NS, TATAMOTORS.NS).
 SUFFIXED_TICKER_RE = re.compile(
-    r"\b[A-Z0-9]{1,12}\.(?:HK|SS|SZ|NS|BO|TO|AX|L|T)\b|\b[A-Z]{2,5}-USD\b"
+    _L + r"(?:[A-Z0-9]{1,12}\.(?:HK|SS|SZ|NS|BO|TO|AX|L|T)|(?i:[A-Z]{2,5}-USD))" + _R
 )
 # Bare all-caps tokens: classic 1-5 char US/EU/JP style (AAPL, SPY, AZN).
 # Longer bare tokens are NOT guessed — use the explicit form instead.
-BARE_TICKER_RE = re.compile(r"\b[A-Z]{1,5}\b")
+BARE_TICKER_RE = re.compile(_L + r"[A-Z]{1,5}" + _R)
+# Coins named on their own (BTC, btc, 比特币) mean the coin in dollars, the
+# ticker Yahoo Finance quotes it under (BTC-USD): bare BTC is not a stock, and
+# only a -USD ticker can be traded on Hyperliquid.
+CRYPTO_COINS = ("BTC", "ETH", "SOL", "XRP", "DOGE", "BNB", "ADA", "AVAX", "LINK", "LTC", "DOT", "TRX")
+CRYPTO_NAMES = {
+    "比特币": "BTC", "以太坊": "ETH", "以太币": "ETH", "狗狗币": "DOGE",
+    "瑞波币": "XRP", "莱特币": "LTC", "币安币": "BNB",
+    "bitcoin": "BTC", "ethereum": "ETH", "solana": "SOL", "dogecoin": "DOGE",
+}
+COIN_RE = re.compile(
+    _L + "(" + "|".join(CRYPTO_COINS) + ")" + _R + "|" + "|".join(CRYPTO_NAMES), re.I
+)
+
+
+def _in_dollars(ticker: str) -> str:
+    """A bare coin (BTC) as the ticker it is analysed and traded under (BTC-USD)."""
+    return f"{ticker}-USD" if ticker.upper() in CRYPTO_COINS else ticker
 DECISION_MARKER_RE = re.compile(r"^\s*[-*]?\s*(?:Final\s+Decision|Decision|Rating):\s*(.+?)\s*$", re.M | re.I)
 
 
@@ -176,19 +198,25 @@ def parse_request(text: str) -> dict | None:
 
     m = EXPLICIT_TICKER_RE.search(text)
     if m:
-        ticker = m.group(1).upper().strip(".")
+        ticker = _in_dollars(m.group(1).upper().strip("."))
     else:
         # Exchange-suffixed first (unambiguous, any base length), then
-        # conservative bare 1-5 char tokens with a stopword filter.
+        # conservative bare 1-5 char tokens with a stopword filter, then a
+        # coin named in any case or by name (btc, 比特币).
         m = SUFFIXED_TICKER_RE.search(text)
         if m:
-            ticker = m.group(0)
+            ticker = m.group(0).upper()
         else:
             for cand in BARE_TICKER_RE.findall(text):
                 if cand in STOPWORDS:
                     continue
-                ticker = cand
+                ticker = _in_dollars(cand)
                 break
+            if ticker is None:
+                m = COIN_RE.search(text)
+                if m:
+                    coin = m.group(1) or CRYPTO_NAMES[m.group(0).lower()]
+                    ticker = f"{coin.upper()}-USD"
 
     m = EXPLICIT_DATE_RE.search(text) or BARE_DATE_RE.search(text)
     if m:
@@ -275,7 +303,8 @@ HELP_TEXT = (
     "  • Analyze NVDA on 2026-11-20\n"
     "  • ticker: 600519.SS  date: 2026-11-19\n"
     "  • How is BTC-USD doing today?\n"
-    "Any market Yahoo Finance covers works (US, HK .HK, A-shares .SS/.SZ, crypto -USD, …).\n"
+    "Any market Yahoo Finance covers works (US, HK .HK, A-shares .SS/.SZ, crypto -USD, …); "
+    "a coin on its own (BTC, 比特币) means it in dollars (BTC-USD).\n"
     "An analysis runs the full multi-agent pipeline (analyst team → bull/bear debate → "
     "trader → risk team → portfolio manager) and typically takes 10-40 minutes. "
     "You can ask me for progress at any time.\n"
@@ -631,7 +660,11 @@ def wallet_reply(command: str) -> str:
     try:
         address = hl_trade.wallet_address()
     except hl_trade.Refused as e:
-        return f"No wallet yet ({e}). Its owner opens it on the agent's page in the ClawUp console."
+        if e.code == "WALLET_NOT_CREATED":
+            return "No wallet yet. Its owner opens it on the agent's page in the ClawUp console."
+        # Anything else (ClawUp unreachable, the token refused) is not a
+        # missing wallet: say what it is, or the owner looks in the wrong place.
+        return f"Could not get this agent's wallet from ClawUp: {e}"
     if not TRADE_ENABLED:
         trading = "Trading is off for this agent."
     elif TRADE_ORDER_USD <= 0:

@@ -14,7 +14,7 @@ Upstream publishes no registry image, so it is built here:
 # from a clone of this repo):
 docker build \
   --build-arg TA_VERSION=v0.7.1 \
-  -t clawup/tradingagents:0.7.1-shim6 \
+  -t clawup/tradingagents:0.7.1-shim7 \
   -f Dockerfile .
 
 # GHCR publish: merge to main or dispatch publish-runtime-image (see repo workflow)
@@ -79,6 +79,10 @@ is a limit order (IOC, 5% through the mid price, as the SDK's market orders are)
 is stated up front. Code: `shim/hl_trade.py`, run with the Hyperliquid Python SDK in its own
 venv (`/opt/hl`).
 
+A coin named on its own in chat (`BTC`, `btc`, `比特币`, `Bitcoin`) is analysed as the coin in
+dollars (`BTC-USD`), so it can be traded; a ticker may sit right against Chinese text
+(`如何交易BTC吗`).
+
 | Env | Meaning |
 |---|---|
 | `TA_TRADE_HYPERLIQUID` | `1` turns trading on |
@@ -131,7 +135,7 @@ docker run -d --name ta-e2e \
   -e OPENCLAW_STATE_DIR=/home/appuser/.tradingagents \
   -e OPENCLAW_GATEWAY_TOKEN=e2e-token -e MOCK_KEY=mock-key \
   -p 127.0.0.1:18788:18789 \
-  clawup/tradingagents:0.7.1-shim6 \
+  clawup/tradingagents:0.7.1-shim7 \
   sh -lc "TA_MODE='compatible' TA_LLM_PROVIDER='' TA_QUICK_MODEL='mock-model' \
 TA_DEEP_MODEL='mock-model' TA_BACKEND_URL='http://host.docker.internal:9999/v1' \
 TA_API_KEY_ENV='MOCK_KEY' TA_API_KEY_RAW=\"\${MOCK_KEY:-}\" \
