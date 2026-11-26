@@ -13,7 +13,7 @@ in this repo. This repo builds the one that needs a ClawUp-baked gateway shim
 |---|---|---|
 | **openclaw** | `ghcr.io/openclaw/openclaw:2026.11.6` (catalog; Compose has a separate fallback) | Upstream open source — pulled directly, not built here |
 | **hermes** | `nousresearch/hermes-agent:v0.23.3` | Upstream open source — pulled directly, not built here |
-| **tradingagents** | `ghcr.io/attestx/tradingagents:0.7.1-shim6` (current catalog) | **Built here** — `tradingagents/` (upstream v0.7.1 + ClawUp gateway shim) |
+| **tradingagents** | `ghcr.io/attestx/tradingagents:0.7.1-shim7` (current catalog) | **Built here** — `tradingagents/` (upstream v0.7.1 + ClawUp gateway shim) |
 
 The Python gateway adapter here is distinct from the Rust `trusted-shim` node
 service. It does not schedule containers or generate policy proofs.
@@ -36,7 +36,7 @@ tradingagents/
 
 - **Local / box builds** (optional development tags):
   `clawup/<runtime>:<upstream-version>-shim<N>`, e.g.
-  `clawup/tradingagents:0.7.1-shim6`.
+  `clawup/tradingagents:0.7.1-shim7`.
 - **GHCR publishes**: `ghcr.io/<repository-owner>/<runtime>:<upstream-version>-shim<N>`
   (same suffix). The ClawUp catalog entry in `backend/bot_runtimes.json` and
   the `Makefile` target in ClawUp must carry the **same tag** — bump them

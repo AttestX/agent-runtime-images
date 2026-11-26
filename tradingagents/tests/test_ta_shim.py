@@ -87,6 +87,24 @@ class TestParseRequest(ShimTestCase):
     def test_no_ticker(self):
         self.assertIsNone(m.parse_request("hello there"))
         self.assertIsNone(m.parse_request("THE"))
+        self.assertIsNone(m.parse_request("fine, it.to go"))
+
+    def test_tickers_inside_chinese_text(self):
+        # A CJK character is a word character, so \b found no ticker here.
+        self.assertEqual(m.parse_request("如何交易BTC吗？")["ticker"], "BTC-USD")
+        self.assertEqual(m.parse_request("分析NVDA 2026-11-20"),
+                         {"ticker": "NVDA", "date": "2026-11-20"})
+        self.assertEqual(m.parse_request("0700.HK怎么样")["ticker"], "0700.HK")
+        self.assertEqual(m.parse_request("日期:2026-11-19分析AAPL"),
+                         {"ticker": "AAPL", "date": "2026-11-19"})
+
+    def test_a_bare_coin_is_the_coin_in_dollars(self):
+        for text in ("BTC", "analyze btc", "比特币怎么样", "Bitcoin today", "ticker: btc",
+                     "I HOLD BTC", "分析 btc-usd"):
+            self.assertEqual(m.parse_request(text)["ticker"], "BTC-USD", text)
+        self.assertEqual(m.parse_request("以太坊")["ticker"], "ETH-USD")
+        # A stock named first stays the stock.
+        self.assertEqual(m.parse_request("NVDA vs BTC")["ticker"], "NVDA")
 
 
 # -- decision extraction (regression: the reversal) ------------------------

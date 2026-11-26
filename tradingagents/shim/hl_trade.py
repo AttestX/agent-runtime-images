@@ -48,7 +48,12 @@ ACCOUNT = os.environ.get("TA_HL_ACCOUNT", "").strip()
 
 
 class Refused(Exception):
-    """Not signed: a mandate refused, or ClawUp did not sign."""
+    """Not signed: a mandate refused, or ClawUp did not sign. ``code`` is
+    ClawUp's error code when it answered with one (e.g. WALLET_NOT_CREATED)."""
+
+    def __init__(self, message: str, code: str | None = None):
+        super().__init__(message)
+        self.code = code
 
 
 def coin_of(ticker: str) -> str | None:
@@ -118,7 +123,10 @@ def clawup(method: str, path: str, body: dict | None = None) -> dict:
             answer = json.load(e)
         except ValueError:
             answer = {}
-        raise Refused(answer.get("message") or f"ClawUp answered {e.code}") from None
+        if not isinstance(answer, dict):
+            answer = {}
+        code = answer.get("error") if isinstance(answer.get("error"), str) else None
+        raise Refused(answer.get("message") or f"ClawUp answered {e.code}", code) from None
     except (urllib.error.URLError, OSError) as e:
         raise Refused(f"ClawUp is unreachable: {e}") from None
 
