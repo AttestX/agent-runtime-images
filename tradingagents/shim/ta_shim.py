@@ -75,6 +75,18 @@ except ValueError:
 HL_PYTHON = os.environ.get("TA_HL_PYTHON", "/opt/hl/bin/python")
 TRADE_TIMEOUT_SECONDS = 120
 
+# Chat channels (Telegram, Feishu, ...): channel-gateway, embedded in the image
+# at /opt/channels (github.com/AttestX/channel-gateway). The shim starts it
+# beside itself; it stays idle until the platform writes a chat app's
+# credentials into $CHANNEL_GATEWAY_HOME/.env, then forwards each allowed
+# user's message to this shim's /v1/chat/completions. Its directory sits in the
+# state dir, so paired users and chat history are backed up with the agent.
+CHANNEL_GATEWAY_BIN = os.environ.get("TA_CHANNEL_GATEWAY_BIN", "/opt/channels/bin/channel-gateway")
+CHANNEL_GATEWAY_HOME = os.environ.get("CHANNEL_GATEWAY_HOME") or os.path.join(DATA_ROOT, "channels")
+CHANNEL_GATEWAY_STOP_SECONDS = 25
+# The gateway names the chat on every request; the console never sends it.
+CHANNEL_SESSION_HEADER = "X-Hermes-Session-Id"
+
 
 def ta_config() -> dict:
     """Read the TA_* bootstrap vars.
@@ -758,7 +770,21 @@ def _result_text(run: Run) -> str:
     return "\n".join(lines)
 
 
-def _handle_chat(handler: BaseHTTPRequestHandler, body: bytes) -> None:
+def _sse_comment(handler: BaseHTTPRequestHandler, text: str) -> bool:
+    """An SSE comment: keeps the connection alive, and no client shows it."""
+    try:
+        handler.wfile.write(f": {text}\n\n".encode("utf-8"))
+        handler.wfile.flush()
+        return True
+    except (BrokenPipeError, ConnectionResetError, OSError):
+        return False
+
+
+def _handle_chat(handler: BaseHTTPRequestHandler, body: bytes, from_channel: bool = False) -> None:
+    """One chat turn. ``from_channel``: the request comes from a chat app (through
+    channel-gateway), which shows every content chunk to the user and holds the
+    chat's next message until this answer ends. So heartbeats there are SSE
+    comments, and the user is not invited to ask for progress meanwhile."""
     try:
         payload = json.loads(body.decode("utf-8")) if body else {}
     except (ValueError, UnicodeDecodeError):
@@ -842,7 +868,9 @@ def _handle_chat(handler: BaseHTTPRequestHandler, body: bytes) -> None:
             f"Starting analysis of {run.ticker} (date {run.date}). "
             "Pipeline: analyst team → bull/bear researcher debate → trader → "
             "risk team → portfolio manager. This usually takes 10-40 minutes; "
-            "I'll report progress as it runs, and you can ask 'progress' anytime."
+            + ("I'll send the result here when it is done."
+               if from_channel else
+               "I'll report progress as it runs, and you can ask 'progress' anytime.")
         )
         if not _sse_chunk(handler, {"role": "assistant", "content": intro + "\n"}, None):
             return  # client gone; run continues in background
@@ -869,7 +897,11 @@ def _handle_chat(handler: BaseHTTPRequestHandler, body: bytes) -> None:
         if run.status != "running":
             break
         if time.time() - last_beat >= HEARTBEAT_SECONDS:
-            if not _sse_chunk(handler, {"role": "assistant", "content": f"\nrunning for {run.elapsed()}\n"}, None):
+            if from_channel:
+                alive = _sse_comment(handler, f"running for {run.elapsed()}")
+            else:
+                alive = _sse_chunk(handler, {"role": "assistant", "content": f"\nrunning for {run.elapsed()}\n"}, None)
+            if not alive:
                 return  # client gone; run continues in background
             last_beat = time.time()
 
@@ -945,7 +977,7 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError:
             length = 0
         body = self.rfile.read(length) if length > 0 else b""
-        _handle_chat(self, body)
+        _handle_chat(self, body, from_channel=bool(self.headers.get(CHANNEL_SESSION_HEADER)))
 
 
 # ---------------------------------------------------------------------------
@@ -953,8 +985,74 @@ class Handler(BaseHTTPRequestHandler):
 # ---------------------------------------------------------------------------
 
 
+class ChannelGateway:
+    """Keeps channel-gateway running beside the shim, if the image has it."""
+
+    def __init__(self, binary: str, home: str, port: int) -> None:
+        self.binary, self.home, self.port = binary, home, port
+        self.proc: subprocess.Popen | None = None
+        self.stopping = threading.Event()
+
+    def env(self) -> dict:
+        # The gateway hands none of this to the chat apps' code: it keeps only
+        # the agent key (OPENCLAW_GATEWAY_TOKEN) and locale, proxy and TLS settings.
+        env = dict(os.environ)
+        env["CHANNEL_GATEWAY_HOME"] = self.home
+        env["CHANNEL_GATEWAY_AGENT_URL"] = f"http://127.0.0.1:{self.port}"
+        return env
+
+    def start(self) -> bool:
+        if not (os.path.isfile(self.binary) and os.access(self.binary, os.X_OK)):
+            return False
+        threading.Thread(target=self._keep, daemon=True).start()
+        return True
+
+    def _keep(self) -> None:
+        backoff = 1.0
+        while not self.stopping.is_set():
+            started = time.time()
+            try:
+                self.proc = subprocess.Popen([self.binary], env=self.env(), start_new_session=True)
+            except OSError as exc:
+                _log(f"channel gateway did not start: {exc}")
+                return
+            code = self.proc.wait()
+            if self.stopping.is_set():
+                return
+            if time.time() - started > 60:
+                backoff = 1.0
+            _log(f"channel gateway exited with {code}; restarting in {backoff:.0f}s")
+            self.stopping.wait(backoff)
+            backoff = min(backoff * 2, 60.0)
+
+    def stop(self) -> None:
+        self.stopping.set()
+        proc = self.proc
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.terminate()
+            except OSError:
+                pass
+
+    def wait(self, seconds: float) -> None:
+        proc = self.proc
+        if proc is None:
+            return
+        try:
+            proc.wait(seconds)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)  # with the Hermes gateway it supervises
+            except OSError:
+                pass
+
+
+CHANNELS = ChannelGateway(CHANNEL_GATEWAY_BIN, CHANNEL_GATEWAY_HOME, GATEWAY_PORT)
+
+
 def _sigterm_handler(signum, frame) -> None:
     _log(f"received signal {signum}; shutting down")
+    CHANNELS.stop()
     run = SLOT.get()
     if run is not None and run.proc is not None and run.status == "running":
         try:
@@ -980,10 +1078,14 @@ def main() -> None:
         f"quick={ta_config()['quick_model'] or '-'} deep={ta_config()['deep_model'] or '-'} "
         f"data_root={DATA_ROOT})"
     )
+    if CHANNELS.start():
+        _log(f"channel gateway started (its directory: {CHANNEL_GATEWAY_HOME})")
     try:
         server.serve_forever(poll_interval=0.5)
     finally:
         server.server_close()
+        CHANNELS.stop()
+        CHANNELS.wait(CHANNEL_GATEWAY_STOP_SECONDS)
 
 
 if __name__ == "__main__":
