@@ -12,11 +12,14 @@ Covers the review-finding regressions:
 """
 
 import importlib.util
+import json
 import os
 import shutil
 import tempfile
+import threading
 import time
 import unittest
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -279,6 +282,114 @@ class TestResolveTurn(ShimTestCase):
         # different ticker -> fresh run
         self.assertEqual(m.resolve_turn("analyze TSLA", P("analyze TSLA"), done),
                          ("start", P("analyze TSLA")))
+
+
+# -- the stream: heartbeats a console shows, and ones a chat app must not --
+
+FAKE_CLI = Path(__file__).resolve().parent / "fake_tradingagents.py"
+
+
+class TestStream(ShimTestCase):
+    def setUp(self):
+        super().setUp()
+        os.environ["TA_BIN"] = str(FAKE_CLI)
+        os.environ["TA_FAKE_SECONDS"] = "2.5"
+        self._old = (m.SLOT, m.HEARTBEAT_SECONDS, m.GATEWAY_TOKEN)
+        m.SLOT, m.HEARTBEAT_SECONDS, m.GATEWAY_TOKEN = m.RunSlot(), 0.5, "test-token"
+        self.server = m.ThreadingHTTPServer(("127.0.0.1", 0), m.Handler)
+        self.server.daemon_threads = True
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        m.SLOT, m.HEARTBEAT_SECONDS, m.GATEWAY_TOKEN = self._old
+        os.environ.pop("TA_FAKE_SECONDS", None)
+        super().tearDown()
+
+    def chat(self, text, headers=None):
+        """(content shown to the user, SSE comment lines) of one streamed turn."""
+        body = json.dumps({"stream": True, "messages": [{"role": "user", "content": text}]}).encode()
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{self.server.server_address[1]}/v1/chat/completions", data=body,
+            headers={"Authorization": "Bearer test-token", "Content-Type": "application/json", **(headers or {})})
+        content, comments = "", []
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            for raw in resp:
+                line = raw.decode().rstrip("\n")
+                if line.startswith(":"):
+                    comments.append(line)
+                elif line.startswith("data: ") and line != "data: [DONE]":
+                    delta = json.loads(line[6:])["choices"][0]["delta"]
+                    content += delta.get("content", "")
+        return content, comments
+
+    def test_console_sees_progress(self):
+        content, comments = self.chat("Analyze NVDA on 2026-11-20")
+        self.assertIn("running for", content)
+        self.assertIn("ask 'progress'", content)
+        self.assertIn("Final decision: Buy", content)
+        self.assertEqual(comments, [])
+
+    def test_a_chat_app_sees_only_the_answer(self):
+        content, comments = self.chat("Analyze NVDA on 2026-11-20", {"X-Hermes-Session-Id": "telegram:42"})
+        self.assertNotIn("running for", content)
+        self.assertNotIn("progress", content)
+        self.assertIn("I'll send the result here", content)
+        self.assertIn("Final decision: Buy", content)
+        self.assertTrue(comments and all(c.startswith(": running for") for c in comments), comments)
+
+
+# -- the channel gateway beside the shim ----------------------------------
+
+def _lines(path: str) -> list[str]:
+    try:
+        with open(path) as fh:
+            return fh.read().splitlines()
+    except FileNotFoundError:
+        return []
+
+
+def _wait(predicate, seconds: float = 10) -> None:
+    deadline = time.time() + seconds
+    while not predicate() and time.time() < deadline:
+        time.sleep(0.1)
+
+
+class TestChannelGateway(ShimTestCase):
+    def fake(self, body: str) -> str:
+        path = os.path.join(self._tmp, "channel-gateway")
+        with open(path, "w") as fh:
+            fh.write("#!/bin/sh\n" + body)
+        os.chmod(path, 0o755)
+        return path
+
+    def test_absent_from_the_image_means_not_started(self):
+        gw = m.ChannelGateway(os.path.join(self._tmp, "missing"), self._tmp, 18789)
+        self.assertFalse(gw.start())
+
+    def test_started_with_its_directory_and_this_shim_as_the_agent_then_stopped(self):
+        seen = os.path.join(self._tmp, "seen")
+        fake = self.fake(f"echo \"$CHANNEL_GATEWAY_HOME $CHANNEL_GATEWAY_AGENT_URL\" >> {seen}\n"
+                         "trap 'exit 0' TERM\nwhile :; do sleep 0.1; done\n")
+        home = os.path.join(self._tmp, "channels")
+        gw = m.ChannelGateway(fake, home, 18795)
+        self.assertTrue(gw.start())
+        _wait(lambda: _lines(seen))
+        self.assertEqual(_lines(seen), [f"{home} http://127.0.0.1:18795"])
+        gw.stop()
+        gw.wait(5)
+        self.assertIsNotNone(gw.proc.returncode)
+        time.sleep(1.5)
+        self.assertEqual(len(_lines(seen)), 1)  # not restarted once stopped
+
+    def test_restarted_when_it_exits(self):
+        seen = os.path.join(self._tmp, "seen")
+        gw = m.ChannelGateway(self.fake(f"echo started >> {seen}\nexit 3\n"), self._tmp, 18789)
+        gw.start()
+        _wait(lambda: len(_lines(seen)) >= 2)
+        gw.stop()
+        self.assertGreaterEqual(len(_lines(seen)), 2)
 
 
 if __name__ == "__main__":

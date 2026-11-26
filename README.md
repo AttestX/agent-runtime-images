@@ -13,7 +13,7 @@ in this repo. This repo builds the one that needs a ClawUp-baked gateway shim
 |---|---|---|
 | **openclaw** | `ghcr.io/openclaw/openclaw:2026.11.6` (catalog; Compose has a separate fallback) | Upstream open source — pulled directly, not built here |
 | **hermes** | `nousresearch/hermes-agent:v0.23.3` | Upstream open source — pulled directly, not built here |
-| **tradingagents** | `ghcr.io/attestx/tradingagents:0.7.1-shim5` (current catalog) | **Built here** — `tradingagents/` (upstream v0.7.1 + ClawUp gateway shim) |
+| **tradingagents** | `ghcr.io/attestx/tradingagents:0.7.1-shim6` (current catalog) | **Built here** — `tradingagents/` (upstream v0.7.1 + ClawUp gateway shim) |
 
 The Python gateway adapter here is distinct from the Rust `trusted-shim` node
 service. It does not schedule containers or generate policy proofs.
@@ -28,14 +28,15 @@ tradingagents/
 ├── Dockerfile          # pinned upstream (ARG) + baked ClawUp gateway shim
 ├── README.md           # per-image notes: layout, build, local e2e
 ├── mock_llm.py         # offline e2e tool (minimal OpenAI-compatible server)
-└── shim/ta_shim.py     # stdlib-only gateway adapter (18789 contract)
+├── shim/ta_shim.py     # stdlib-only gateway adapter (18789 contract)
+└── tests/              # shim unit tests; test_image.py runs the built image
 ```
 
 ## Image naming
 
 - **Local / box builds** (optional development tags):
   `clawup/<runtime>:<upstream-version>-shim<N>`, e.g.
-  `clawup/tradingagents:0.7.1-shim5`.
+  `clawup/tradingagents:0.7.1-shim6`.
 - **GHCR publishes**: `ghcr.io/<repository-owner>/<runtime>:<upstream-version>-shim<N>`
   (same suffix). The ClawUp catalog entry in `backend/bot_runtimes.json` and
   the `Makefile` target in ClawUp must carry the **same tag** — bump them

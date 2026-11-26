@@ -14,7 +14,7 @@ Upstream publishes no registry image, so it is built here:
 # from a clone of this repo):
 docker build \
   --build-arg TA_VERSION=v0.7.1 \
-  -t clawup/tradingagents:0.7.1-shim5 \
+  -t clawup/tradingagents:0.7.1-shim6 \
   -f Dockerfile .
 
 # GHCR publish: merge to main or dispatch publish-runtime-image (see repo workflow)
@@ -30,6 +30,7 @@ Layout:
 ```
 /opt/venv/                  TradingAgents + deps (entry point: `tradingagents`)
 /opt/ta-shim/ta_shim.py     gateway shim (stdlib-only)
+/opt/channels/              channel-gateway: chat apps (Telegram, Feishu, ...), own Python
 /home/appuser/.tradingagents/  data root (memory log, checkpoints, reports)
                              = the bot's state dir → ClawUp OSS backup/restore
 ```
@@ -41,6 +42,32 @@ PID 1 and `exec`s the shim; there is deliberately no ENTRYPOINT in the image.
 `appuser` is uid/gid 1000, matching the provisioner's deploy-account
 resolution for the `tradingagents` runtime type. Full design:
 ClawUp's `design/tradingagents-runtime.md`.
+
+## Chat channels
+
+Owners can talk to the agent from Telegram, Feishu/Lark, Slack, Discord, DingTalk, WeCom or
+Mattermost. The image embeds [channel-gateway](https://github.com/AttestX/channel-gateway)
+(Hermes's messaging gateway in proxy mode, pinned by digest in the `Dockerfile`) in
+`/opt/channels`, and the shim starts it beside itself and restarts it if it exits.
+
+- It stays idle until the platform writes a chat app's credentials into
+  `$TA_STATE_DIR/channels/.env` (`CHANNEL_GATEWAY_HOME` overrides the directory; see
+  channel-gateway's `CONTRACT.md` for the file and the variable names). It then forwards each
+  allowed user's message to the shim's own `http://127.0.0.1:$GATEWAY_PORT`, with the gateway
+  token. The agent's other secrets (model keys) never reach it.
+- The directory is in the state dir, so paired users and chat history are backed up with the
+  agent.
+- A request from the gateway carries `X-Hermes-Session-Id`. For those, the shim sends its
+  heartbeats as SSE comments (a chat app would show text heartbeats as messages) and does not
+  invite the user to ask for progress: the gateway holds a chat's next message until the
+  current answer ends, so the result arrives as one message. The console's requests are
+  unchanged.
+- New users are let in by an allowlist in `.env`, or paired: the owner approves the code the
+  bot sent them by running, in the container,
+  `CHANNEL_GATEWAY_HOME=$TA_STATE_DIR/channels /opt/channels/bin/channel-gateway pair <app> <code>`.
+
+It adds about 700 MB to the image (uncompressed) and about 300 MiB of memory while a chat app
+is connected.
 
 ## Trading on Hyperliquid (optional)
 
@@ -78,6 +105,18 @@ Anything else the SDK would sign (withdrawals, transfers) is refused by the sign
 ClawUp. Testnet is not traded: trusted-rail refuses testnet actions, since testnet numbers its
 assets differently. `wallet` (or `钱包`) in chat shows the agent's wallet and what it will do.
 
+## Tests
+
+```sh
+python3 -m unittest discover -s tradingagents/tests -v      # the shim; image test skipped
+docker build -t ta:test -f tradingagents/Dockerfile tradingagents
+TA_IMAGE=ta:test python3 -m unittest -v tradingagents/tests/test_image.py
+```
+
+The image test runs the real shim and gateway against a stand-in Telegram Bot API and a
+stand-in TradingAgents CLI: an allowed user's request is analysed and answered in one message
+with no heartbeat text, and a stranger's is ignored.
+
 ## Local e2e (no real LLM key needed)
 
 `mock_llm.py` is a minimal OpenAI-compatible server (stdlib only) used to
@@ -92,7 +131,7 @@ docker run -d --name ta-e2e \
   -e OPENCLAW_STATE_DIR=/home/appuser/.tradingagents \
   -e OPENCLAW_GATEWAY_TOKEN=e2e-token -e MOCK_KEY=mock-key \
   -p 127.0.0.1:18788:18789 \
-  clawup/tradingagents:0.7.1-shim5 \
+  clawup/tradingagents:0.7.1-shim6 \
   sh -lc "TA_MODE='compatible' TA_LLM_PROVIDER='' TA_QUICK_MODEL='mock-model' \
 TA_DEEP_MODEL='mock-model' TA_BACKEND_URL='http://host.docker.internal:9999/v1' \
 TA_API_KEY_ENV='MOCK_KEY' TA_API_KEY_RAW=\"\${MOCK_KEY:-}\" \

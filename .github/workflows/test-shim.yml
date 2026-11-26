@@ -1,4 +1,4 @@
-# Behavior tests for the runtime shims (stdlib-only, no docker needed).
+# Behavior tests for the runtime shims (stdlib-only), and the built image end to end.
 name: test-shim
 
 on:
@@ -18,3 +18,16 @@ jobs:
 
       - name: Run TradingAgents shim tests
         run: python3 -m unittest discover -s tradingagents/tests -v
+
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build the TradingAgents image
+        run: docker build -t ta:test -f tradingagents/Dockerfile tradingagents
+
+      - name: Run the image end to end (Telegram stand-in -> channel gateway -> shim)
+        env:
+          TA_IMAGE: ta:test
+        run: python3 -m unittest -v tradingagents/tests/test_image.py
