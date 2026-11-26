@@ -21,7 +21,7 @@ Design rules:
 3. **Stdlib only.**  The image already carries TradingAgents' heavy
    dependency tree; the shim adds nothing to it.  Trading (optional, off
    unless TA_TRADE_HYPERLIQUID is set) runs in hl_trade.py, in its own venv
-   with the Hyperliquid SDK, signed by the owner's Privy wallet.
+   with the Hyperliquid SDK, signed by the agent's ClawUp wallet.
 
 Configuration arrives as TA_* env vars exported by the provisioner's
 bootstrap script (see runtime-provisioner/scripts.go, buildTradingAgentsBootstrap).
@@ -269,8 +269,8 @@ HELP_TEXT = (
     "You can ask me for progress at any time.\n"
     "After a run finishes, asking about the same ticker returns its saved result — "
     "to run it again, name an explicit date or say 're-run'.\n"
-    "Trading on Hyperliquid (when the owner has turned it on): 'connect wallet' signs in "
-    "your Privy wallet, 'wallet' shows it, 'disconnect wallet' signs out."
+    "Trading on Hyperliquid (when the owner has turned it on): 'wallet' shows this agent's "
+    "wallet and what it will do."
 )
 
 
@@ -602,118 +602,24 @@ def _trade(run: Run) -> str | None:
 
 
 # ---------------------------------------------------------------------------
-# The owner's Privy wallet (chat commands)
+# The agent's wallet (chat command)
 # ---------------------------------------------------------------------------
 
-WALLET_COMMANDS = {
-    "status": ("wallet", "wallet status", "my wallet", "钱包", "钱包状态", "我的钱包"),
-    "connect": ("connect wallet", "connect my wallet", "wallet login", "login wallet",
-                "连接钱包", "登录钱包", "钱包登录"),
-    "disconnect": ("disconnect wallet", "disconnect my wallet", "wallet logout", "logout wallet",
-                   "断开钱包", "退出钱包", "钱包退出"),
-}
+WALLET_PHRASES = ("wallet", "wallet status", "my wallet", "钱包", "钱包状态", "我的钱包")
 
 
 def wallet_command(text: str) -> str | None:
-    """'connect wallet' -> "connect", ...; None for anything else."""
+    """'wallet' -> "status"; None for anything else."""
     t = re.sub(r"[\s.!?。！？]+", " ", (text or "").strip().lower()).strip()
-    for command, phrases in WALLET_COMMANDS.items():
-        if t in phrases:
-            return command
-    return None
-
-
-class Login:
-    """One Privy device login at a time. The CLI prints a URL and a code,
-    then waits until the owner approves; the wait outlives the chat turn."""
-
-    URL_RE = re.compile(r"https://\S+")
-    CODE_RE = re.compile(r"Your code:\s*(\S+)")
-
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self.proc: subprocess.Popen | None = None
-        self.url: str | None = None
-        self.code: str | None = None
-        self.output: deque = deque(maxlen=40)
-        self.result: str | None = None  # "connected" | an error, once the CLI exits
-
-    def start(self) -> str:
-        with self._lock:
-            if self.proc is not None and self.proc.poll() is None and self.url:
-                return self._prompt()
-            self.url = self.code = self.result = None
-            self.output.clear()
-            ready = threading.Event()
-            try:
-                self.proc = subprocess.Popen(
-                    [hl_trade.PRIVY_CLI, "login"], env=hl_trade.privy_env(), text=True,
-                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                )
-            except OSError as e:
-                return f"The Privy CLI is not available here ({e})."
-            threading.Thread(target=self._read, args=(self.proc, ready), daemon=True).start()
-        ready.wait(30)
-        with self._lock:
-            if self.url and self.code:
-                return self._prompt()
-            tail = " ".join(self.output).strip()
-            if "Already logged in" in tail:
-                return "Your wallet is already connected. Say 'wallet' to see it."
-            return f"Privy did not start a login: {tail[-300:] or 'no answer'}"
-
-    def _prompt(self) -> str:
-        return (
-            f"Open {self.url} and approve with code {self.code}. "
-            "Privy holds the key; this agent only asks it to sign. "
-            "Say 'wallet' afterwards to check."
-        )
-
-    def _read(self, proc: subprocess.Popen, ready: threading.Event) -> None:
-        assert proc.stdout is not None
-        for line in proc.stdout:
-            line = line.strip()
-            if not line:
-                continue
-            with self._lock:
-                self.output.append(line)
-                if self.url is None and (m := self.URL_RE.search(line)):
-                    self.url = m.group(0)
-                if (m := self.CODE_RE.search(line)):
-                    self.code = m.group(1)
-                if self.url and self.code:
-                    ready.set()
-        rc = proc.wait()
-        with self._lock:
-            self.result = "connected" if rc == 0 else (" ".join(self.output)[-300:] or f"exit {rc}")
-        _log(f"privy login ended: {self.result}")
-        ready.set()
-
-    def pending(self) -> bool:
-        with self._lock:
-            return self.proc is not None and self.proc.poll() is None
-
-
-LOGIN = Login()
+    return "status" if t in WALLET_PHRASES else None
 
 
 def wallet_reply(command: str) -> str:
-    if command == "connect":
-        return LOGIN.start()
-    if command == "disconnect":
-        try:
-            hl_trade.privy(["logout"])
-        except (OSError, RuntimeError, subprocess.TimeoutExpired) as e:
-            return f"Could not disconnect: {e}"
-        return "Wallet disconnected. This agent can no longer sign."
-    if LOGIN.pending():
-        return "Waiting for you to approve the login in Privy. " + LOGIN._prompt()
+    """The agent's wallet, kept by ClawUp, and what the agent will do with it."""
     try:
         address = hl_trade.wallet_address()
-    except (OSError, RuntimeError, subprocess.TimeoutExpired) as e:
-        ended = LOGIN.result
-        why = f" The last login ended: {ended}." if ended and ended != "connected" else ""
-        return f"No wallet connected ({e}).{why} Say 'connect wallet' to sign in to Privy."
+    except hl_trade.Refused as e:
+        return f"No wallet yet ({e}). Its owner opens it on the agent's page in the ClawUp console."
     if not TRADE_ENABLED:
         trading = "Trading is off for this agent."
     elif TRADE_ORDER_USD <= 0:
@@ -721,8 +627,8 @@ def wallet_reply(command: str) -> str:
     else:
         trading = (
             f"After a Buy rating on a crypto ticker this agent buys ${TRADE_ORDER_USD:g} of it on "
-            "Hyperliquid; after a Sell it closes the long. Each order is first asked of your "
-            "ClawUp mandate."
+            "Hyperliquid; after a Sell it closes the long. ClawUp signs each order only if every "
+            "mandate bound to this agent allows it."
         )
     account = hl_trade.ACCOUNT
     if account and account.lower() != address.lower():
@@ -731,8 +637,8 @@ def wallet_reply(command: str) -> str:
             f"{address} as an API wallet."
         )
     else:
-        trades_for = " It trades for its own Hyperliquid account."
-    return f"Wallet: {address} (Privy).{trades_for} {trading}"
+        trades_for = " It trades for its own Hyperliquid account: send USDC to it there."
+    return f"Wallet: {address} (kept by ClawUp).{trades_for} {trading}"
 
 
 def _start_proc(run: Run) -> None:
