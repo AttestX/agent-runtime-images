@@ -16,7 +16,9 @@ signed, so the request carries the action itself; ClawUp checks that it
 hashes to what is signed, asks every mandate bound to the agent, and signs
 only if all of them allow it. Then the SDK posts it to /exchange. Anything
 else the SDK would sign (withdrawals, transfers) is refused by the signer, and
-by ClawUp.
+by ClawUp. Funds move only by the owner's approval, one exact request at a
+time, from the agent's panel (below `RemoteSigner`'s helpers: `usd_send`,
+`usd_class_transfer`, `ask_approval`).
 
 Runs in its own venv with the SDK (/opt/hl); the shim calls
 `python hl_trade.py <command> ...` and reads one JSON object from stdout.
@@ -146,6 +148,189 @@ def trading_account() -> str:
             raise Refused("TA_HL_ACCOUNT is not an address")
         return ACCOUNT
     return wallet_address()
+
+
+# ---------------------------------------------------------------------------
+# The wallet's funds, and moving them by its owner's approval (the panel)
+# ---------------------------------------------------------------------------
+
+# The chain a user-signed action is signed under, as the SDK signs it; the
+# action names it again in `signatureChainId`.
+SIGNATURE_CHAIN_ID = "0x66eee"
+USDC_RE = re.compile(r"\d{1,12}(?:\.\d{1,6})?")
+
+
+def hyperliquid(path: str, body: dict, timeout: float = 15):
+    """POST to Hyperliquid's API (`/info` or `/exchange`); the JSON answer."""
+    req = urllib.request.Request(
+        f"{BASE_URL}{path}", data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json"}, method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.load(r)
+    except urllib.error.HTTPError as e:
+        detail = e.read()[:300].decode("utf-8", "replace").strip()
+        raise Refused(f"Hyperliquid answered {e.code}: {detail}" if detail else f"Hyperliquid answered {e.code}") from None
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        raise Refused(f"Hyperliquid is unreachable: {e}") from None
+
+
+def usdc(amount: str) -> str | None:
+    """A USDC amount as Hyperliquid takes it ("12.5", "3"), or None when it is
+    not a positive decimal of at most 6 places."""
+    amount = (amount or "").strip()
+    if not USDC_RE.fullmatch(amount):
+        return None
+    whole, _, frac = amount.partition(".")
+    whole, frac = whole.lstrip("0") or "0", frac.rstrip("0")
+    if whole == "0" and not frac:
+        return None
+    return f"{whole}.{frac}" if frac else whole
+
+
+def micro(amount) -> int:
+    """USDC in millionths, from Hyperliquid's decimal string; 0 if unreadable.
+    Digits past the sixth place are dropped."""
+    text = str(amount or "0").strip()
+    neg = text.startswith("-")
+    whole, _, frac = text.lstrip("-").partition(".")
+    if not whole.isdigit() or (frac and not frac.isdigit()):
+        return 0
+    value = int(whole) * 1_000_000 + int((frac + "000000")[:6])
+    return -value if neg else value
+
+
+def shown(micro_usdc: int) -> str:
+    """Millionths of USDC as a decimal string: 12500000 -> "12.5"."""
+    sign = "-" if micro_usdc < 0 else ""
+    whole, frac = divmod(abs(micro_usdc), 1_000_000)
+    return f"{sign}{whole}.{frac:06d}".rstrip("0").rstrip(".")
+
+
+def _nonzero(size) -> bool:
+    try:
+        return float(size) != 0.0
+    except (TypeError, ValueError):
+        return False
+
+
+def holdings(address: str) -> dict:
+    """What `address` holds on Hyperliquid. USDC in millionths: perps (the
+    account value), withdrawable (of perps: the rest is margin), spot_usdc
+    (not on hold); positions [(coin, size)]; spot [(coin, total)] for the
+    other coins."""
+    perps = hyperliquid("/info", {"type": "clearinghouseState", "user": address})
+    spot = hyperliquid("/info", {"type": "spotClearinghouseState", "user": address})
+    if not isinstance(perps, dict) or not isinstance(spot, dict):
+        raise Refused("Hyperliquid answered without a balance")
+    positions = []
+    for p in perps.get("assetPositions") or []:
+        pos = (p or {}).get("position") or {}
+        if pos.get("coin") and _nonzero(pos.get("szi")):
+            positions.append((str(pos["coin"]), str(pos["szi"])))
+    spot_usdc, other = 0, []
+    for b in spot.get("balances") or []:
+        b = b or {}
+        coin = str(b.get("coin") or "")
+        if coin == "USDC":
+            spot_usdc = max(0, micro(b.get("total")) - micro(b.get("hold")))
+        elif coin and _nonzero(b.get("total")):
+            other.append((coin, str(b["total"])))
+    return {
+        "perps": micro((perps.get("marginSummary") or {}).get("accountValue")),
+        "withdrawable": micro(perps.get("withdrawable")),
+        "spot_usdc": spot_usdc,
+        "positions": positions,
+        "spot": other,
+    }
+
+
+def user_signed(primary_type: str, fields: list, action: dict) -> dict:
+    """The EIP-712 typed data of a user-signed action, as the SDK builds it
+    (hyperliquid.utils.signing.user_signed_payload)."""
+    return {
+        "domain": {
+            "name": "HyperliquidSignTransaction",
+            "version": "1",
+            "chainId": int(SIGNATURE_CHAIN_ID, 16),
+            "verifyingContract": "0x0000000000000000000000000000000000000000",
+        },
+        "types": {
+            primary_type: fields,
+            "EIP712Domain": [
+                {"name": "name", "type": "string"},
+                {"name": "version", "type": "string"},
+                {"name": "chainId", "type": "uint256"},
+                {"name": "verifyingContract", "type": "address"},
+            ],
+        },
+        "primaryType": primary_type,
+        "message": {f["name"]: action[f["name"]] for f in fields},
+    }
+
+
+def usd_send(destination: str, amount: str, time_ms: int) -> tuple[dict, dict]:
+    """(action, typed data) sending `amount` USDC from the wallet's perps to
+    `destination` on Hyperliquid (the SDK's usd_transfer)."""
+    action = {
+        "type": "usdSend", "signatureChainId": SIGNATURE_CHAIN_ID, "hyperliquidChain": "Mainnet",
+        "destination": destination.lower(), "amount": amount, "time": time_ms,
+    }
+    return action, user_signed("HyperliquidTransaction:UsdSend", [
+        {"name": "hyperliquidChain", "type": "string"},
+        {"name": "destination", "type": "string"},
+        {"name": "amount", "type": "string"},
+        {"name": "time", "type": "uint64"},
+    ], action)
+
+
+def usd_class_transfer(amount: str, to_perp: bool, nonce: int) -> tuple[dict, dict]:
+    """(action, typed data) moving `amount` USDC between the wallet's spot and
+    perps (the SDK's usd_class_transfer)."""
+    action = {
+        "type": "usdClassTransfer", "signatureChainId": SIGNATURE_CHAIN_ID, "hyperliquidChain": "Mainnet",
+        "amount": amount, "toPerp": to_perp, "nonce": nonce,
+    }
+    return action, user_signed("HyperliquidTransaction:UsdClassTransfer", [
+        {"name": "hyperliquidChain", "type": "string"},
+        {"name": "amount", "type": "string"},
+        {"name": "toPerp", "type": "bool"},
+        {"name": "nonce", "type": "uint64"},
+    ], action)
+
+
+def post_signed(action: dict, nonce: int, signature: str) -> None:
+    """Posts a signed user action to `/exchange`; Refused with Hyperliquid's
+    reason unless it answers ok."""
+    answer = hyperliquid("/exchange", {
+        "action": action, "nonce": nonce, "signature": split_signature(signature), "vaultAddress": None,
+    })
+    if not isinstance(answer, dict) or answer.get("status") != "ok":
+        reason = answer.get("response") if isinstance(answer, dict) else answer
+        raise Refused(f"Hyperliquid refused it: {reason}"[:300])
+
+
+def ask_approval(typed_data: dict, summary: str) -> str:
+    """Asks the agent's owner, through ClawUp, to approve signing
+    `typed_data`; the approval's id. The console shows the owner ClawUp's
+    record of it, not this agent's words alone."""
+    answer = clawup("POST", "/api/v1/runtime/wallet/approvals", {"typed_data": typed_data, "summary": summary})
+    approval_id = answer.get("id")
+    if not isinstance(approval_id, str) or not re.fullmatch(r"[0-9a-f]{32}", approval_id):
+        raise Refused("ClawUp answered without an approval")
+    return approval_id
+
+
+def approval(approval_id: str) -> dict:
+    """{status: pending | approved | declined, signature?, expires_at}, or
+    {status: expired} once ClawUp no longer has it."""
+    try:
+        return clawup("GET", f"/api/v1/runtime/wallet/approvals/{approval_id}")
+    except Refused as e:
+        if e.code == "APPROVAL_NOT_FOUND":
+            return {"status": "expired"}
+        raise
 
 
 def allowed_by(answer: dict) -> str:

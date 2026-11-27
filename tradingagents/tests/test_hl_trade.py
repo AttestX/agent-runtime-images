@@ -190,10 +190,12 @@ class TalksToClawUp(ClawUpCase):
 
 class AfterAnalysis(unittest.TestCase):
     def setUp(self):
-        self.old = (shim.TRADE_ENABLED, shim.TRADE_ORDER_USD, shim.HL_PYTHON)
+        self.old = (shim.TRADE_ENABLED, shim.TRADE_ORDER_USD, shim.HL_PYTHON, shim.DATA_ROOT)
+        shim.DATA_ROOT = tempfile.mkdtemp(prefix="ta-trade-test-")  # no saved panel settings
 
     def tearDown(self):
-        shim.TRADE_ENABLED, shim.TRADE_ORDER_USD, shim.HL_PYTHON = self.old
+        shutil.rmtree(shim.DATA_ROOT, ignore_errors=True)
+        shim.TRADE_ENABLED, shim.TRADE_ORDER_USD, shim.HL_PYTHON, shim.DATA_ROOT = self.old
 
     def run_of(self, ticker, decision):
         run = shim.Run(ticker, "2026-11-25")
@@ -207,7 +209,7 @@ class AfterAnalysis(unittest.TestCase):
         self.assertIsNone(shim._trade(self.run_of("NVDA", "Buy")))
         self.assertIn("rating is Hold", shim._trade(self.run_of("BTC-USD", "Hold")))
         shim.TRADE_ORDER_USD = 0
-        self.assertIn("TA_TRADE_ORDER_USD", shim._trade(self.run_of("BTC-USD", "Buy")))
+        self.assertIn("no order size", shim._trade(self.run_of("BTC-USD", "Buy")))
 
     def test_one_order_through_hl_trade(self):
         # A stand-in for the SDK venv: prints what hl_trade.py would.

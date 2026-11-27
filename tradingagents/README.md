@@ -14,7 +14,7 @@ Upstream publishes no registry image, so it is built here:
 # from a clone of this repo):
 docker build \
   --build-arg TA_VERSION=v0.7.1 \
-  -t clawup/tradingagents:0.7.1-shim7 \
+  -t clawup/tradingagents:0.7.1-shim8 \
   -f Dockerfile .
 
 # GHCR publish: merge to main or dispatch publish-runtime-image (see repo workflow)
@@ -83,10 +83,14 @@ A coin named on its own in chat (`BTC`, `btc`, `比特币`, `Bitcoin`) is analys
 dollars (`BTC-USD`), so it can be traded; a ticker may sit right against Chinese text
 (`如何交易BTC吗`).
 
+The owner turns it on and sets the order size on the agent's panel (below), which keeps them in
+the state dir (`panel-settings.json`, backed up with the agent). Until they are saved there, the
+env sets them:
+
 | Env | Meaning |
 |---|---|
-| `TA_TRADE_HYPERLIQUID` | `1` turns trading on |
-| `TA_TRADE_ORDER_USD` | The size of a buy, in US dollars |
+| `TA_TRADE_HYPERLIQUID` | `1` turns trading on (until the panel's setting is saved) |
+| `TA_TRADE_ORDER_USD` | The size of a buy, in US dollars (likewise) |
 | `CLAWUP_API_URL` | Where the agent asks ClawUp to sign. Default `https://api.clawup.org` |
 | `TA_HL_ACCOUNT` | The Hyperliquid account traded for, e.g. your MetaMask address. Approve the agent's wallet as an API wallet of it first (Hyperliquid app → More → API); it then signs orders for that account and cannot withdraw. Default: the agent's wallet's own account |
 
@@ -106,8 +110,34 @@ An order is built by the official SDK (`hyperliquid-python-sdk`'s `Exchange`: `m
 2. **posted** to `https://api.hyperliquid.xyz/exchange` by the SDK.
 
 Anything else the SDK would sign (withdrawals, transfers) is refused by the signer, and by
-ClawUp. Testnet is not traded: trusted-rail refuses testnet actions, since testnet numbers its
+ClawUp: funds move only by the owner's approval, from the panel.
+Testnet is not traded: trusted-rail refuses testnet actions, since testnet numbers its
 assets differently. `wallet` (or `钱包`) in chat shows the agent's wallet and what it will do.
+
+## The owner's panel
+
+The agent's own panel in the ClawUp console (ClawUp's `design/agent-panel.md`). The console
+sends it as a chat request with a `panel` object and no messages, not streamed, and the shim
+answers it with panel JSON instead of a chat completion: never a message, no model call, no
+analysis, and answered while an analysis runs. A `panel` with messages, or streamed, is refused
+(400). Chat apps cannot send one.
+
+- **Reading** (`"panel": {"locale": "zh" | "en" | "es"}`): the wallet's address; its USDC on
+  Hyperliquid, perps (and what is withdrawable) and spot, its positions and other spot coins;
+  the trading settings; withdrawing and moving between spot and perps; and how the latest
+  transfer went.
+- **Acting** (`"panel": {"action", "inputs", "locale"}`): `save` (`trade`, `order_usd`),
+  `withdraw` (`amount`, `to`), `to_perps` and `to_spot` (`move_amount`).
+
+Funds move only by the owner's approval. For `withdraw` (a `usdSend` from perps) or a move (a
+`usdClassTransfer`), the shim checks the amount against the balance, builds the EIP-712 typed
+data the SDK would sign, and asks ClawUp for the owner's approval
+(`POST /api/v1/runtime/wallet/approvals`, with a one-line summary). It answers the action with
+`{"approval": "<id>"}`, and the console shows the owner ClawUp's record of it. A thread polls
+the approval (`GET /api/v1/runtime/wallet/approvals/<id>`, every 2 s), and once it is approved
+posts the signed action to Hyperliquid, once; declined or expired, nothing is sent. When the
+agent trades for another account (`TA_HL_ACCOUNT`), the panel shows that account's funds and
+moves none of them.
 
 ## Tests
 
@@ -115,6 +145,9 @@ assets differently. `wallet` (or `钱包`) in chat shows the agent's wallet and 
 python3 -m unittest discover -s tradingagents/tests -v      # the shim; image test skipped
 docker build -t ta:test -f tradingagents/Dockerfile tradingagents
 TA_IMAGE=ta:test python3 -m unittest -v tradingagents/tests/test_image.py
+# the tests that need the Hyperliquid SDK, with the image's:
+docker run --rm -v "$PWD/tradingagents:/w:ro" -w /w --entrypoint /opt/hl/bin/python ta:test \
+  -m unittest -v tests.test_hl_trade.SignsForTheSdk tests.test_panel.AsTheSdkSigns
 ```
 
 The image test runs the real shim and gateway against a stand-in Telegram Bot API and a
@@ -135,7 +168,7 @@ docker run -d --name ta-e2e \
   -e OPENCLAW_STATE_DIR=/home/appuser/.tradingagents \
   -e OPENCLAW_GATEWAY_TOKEN=e2e-token -e MOCK_KEY=mock-key \
   -p 127.0.0.1:18788:18789 \
-  clawup/tradingagents:0.7.1-shim7 \
+  clawup/tradingagents:0.7.1-shim8 \
   sh -lc "TA_MODE='compatible' TA_LLM_PROVIDER='' TA_QUICK_MODEL='mock-model' \
 TA_DEEP_MODEL='mock-model' TA_BACKEND_URL='http://host.docker.internal:9999/v1' \
 TA_API_KEY_ENV='MOCK_KEY' TA_API_KEY_RAW=\"\${MOCK_KEY:-}\" \

@@ -7,6 +7,10 @@ Adapts ClawUp's runtime gateway contract to the TradingAgents CLI:
   * GET  /ready                  -> {"ready": true}
   * POST /v1/chat/completions    -> OpenAI-compatible, Bearer-authenticated
   * GET  /v1/ta/status           -> machine-readable run status (same auth)
+  * a chat request with a `panel` object and no messages is the owner's
+    panel in the ClawUp console (ClawUp's design/agent-panel.md): the wallet
+    on Hyperliquid, the trading settings, and moving funds by the owner's
+    approval. It is answered with panel JSON, also while an analysis runs.
 
 Design rules:
 
@@ -67,11 +71,16 @@ MODEL_LABEL = "tradingagents-shim"
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import hl_trade  # noqa: E402  (stdlib at import; the SDK runs in HL_PYTHON)
 
+# The defaults until the owner saves the settings on the agent's panel, which
+# keeps them in the state dir (trade_settings).
 TRADE_ENABLED = os.environ.get("TA_TRADE_HYPERLIQUID", "").strip().lower() in ("1", "true", "yes")
 try:
     TRADE_ORDER_USD = float(os.environ.get("TA_TRADE_ORDER_USD", "0") or 0)
 except ValueError:
     TRADE_ORDER_USD = 0.0
+SETTINGS_FILE = "panel-settings.json"
+# Hyperliquid's minimum order, and a cap (as ClawUp's catalog had them).
+MIN_ORDER_USD, MAX_ORDER_USD = 10.0, 10_000.0
 HL_PYTHON = os.environ.get("TA_HL_PYTHON", "/opt/hl/bin/python")
 TRADE_TIMEOUT_SECONDS = 120
 
@@ -618,18 +627,45 @@ def _extract_decision(run: Run) -> None:
             return
 
 
+def trade_settings() -> tuple[bool, float]:
+    """(trading on, the order size in dollars): what the owner saved on the
+    agent's panel, else the TA_TRADE_* defaults."""
+    try:
+        with open(os.path.join(DATA_ROOT, SETTINGS_FILE), encoding="utf-8") as fh:
+            saved = json.load(fh)
+        usd = float(saved.get("order_usd") or 0)
+        if 0 <= usd <= MAX_ORDER_USD:
+            return saved.get("trade") is True, usd
+        _log("panel settings: an order size out of range; using the defaults")
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError, TypeError, AttributeError) as exc:
+        _log(f"panel settings unreadable ({exc}); using the defaults")
+    return TRADE_ENABLED, TRADE_ORDER_USD
+
+
+def save_trade_settings(trade: bool, order_usd: float) -> None:
+    os.makedirs(DATA_ROOT, exist_ok=True)
+    path = os.path.join(DATA_ROOT, SETTINGS_FILE)
+    tmp = f"{path}.{uuid.uuid4().hex[:8]}.tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump({"trade": trade, "order_usd": order_usd}, fh)
+    os.replace(tmp, path)
+
+
 def _trade(run: Run) -> str | None:
     """At most one Hyperliquid order for a finished analysis (hl_trade.py).
     None when trading is off or the ticker is not crypto quoted in dollars."""
-    if not TRADE_ENABLED or hl_trade.coin_of(run.ticker) is None:
+    trade, order_usd = trade_settings()
+    if not trade or hl_trade.coin_of(run.ticker) is None:
         return None
     if hl_trade.side_of(run.decision) is None:
         return f"no order: the rating is {run.decision or 'unknown'}"
-    if TRADE_ORDER_USD <= 0:
-        return "no order: the order size (TA_TRADE_ORDER_USD) is not set"
+    if order_usd <= 0:
+        return "no order: no order size is set (on the agent's panel)"
     cmd = [
         HL_PYTHON, os.path.join(os.path.dirname(os.path.abspath(__file__)), "hl_trade.py"),
-        "order", "--ticker", run.ticker, "--rating", run.decision or "", "--usd", str(TRADE_ORDER_USD),
+        "order", "--ticker", run.ticker, "--rating", run.decision or "", "--usd", f"{order_usd:g}",
     ]
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=TRADE_TIMEOUT_SECONDS)
@@ -665,13 +701,14 @@ def wallet_reply(command: str) -> str:
         # Anything else (ClawUp unreachable, the token refused) is not a
         # missing wallet: say what it is, or the owner looks in the wrong place.
         return f"Could not get this agent's wallet from ClawUp: {e}"
-    if not TRADE_ENABLED:
+    trade, order_usd = trade_settings()
+    if not trade:
         trading = "Trading is off for this agent."
-    elif TRADE_ORDER_USD <= 0:
+    elif order_usd <= 0:
         trading = "Trading is on, but no order size is set, so nothing is traded."
     else:
         trading = (
-            f"After a Buy rating on a crypto ticker this agent buys ${TRADE_ORDER_USD:g} of it on "
+            f"After a Buy rating on a crypto ticker this agent buys ${order_usd:g} of it on "
             "Hyperliquid; after a Sell it closes the long. ClawUp signs each order only if every "
             "mandate bound to this agent allows it."
         )
@@ -684,6 +721,335 @@ def wallet_reply(command: str) -> str:
     else:
         trades_for = " It trades for its own Hyperliquid account: send USDC to it there."
     return f"Wallet: {address} (kept by ClawUp).{trades_for} {trading}"
+
+
+# ---------------------------------------------------------------------------
+# The owner's panel (a chat request with a `panel` object; ClawUp's
+# design/agent-panel.md)
+# ---------------------------------------------------------------------------
+
+LOCALES = ("zh", "en", "es")
+PANEL_TEXT = {
+    "title": ("交易", "Trading", "Trading"),
+    "wallet": ("Hyperliquid 钱包", "Wallet on Hyperliquid", "Billetera en Hyperliquid"),
+    "address": ("地址", "Address", "Dirección"),
+    "no_wallet": (
+        "这个 Agent 还没有钱包。请在它的卡片上点「钱包」打开。",
+        "This agent has no wallet yet. Open it with the Wallet button on its card.",
+        "Este agente aún no tiene billetera. Ábrela con el botón Billetera de su tarjeta.",
+    ),
+    "wallet_error": (
+        "暂时无法从 ClawUp 取得钱包：{reason}",
+        "Could not get the wallet from ClawUp: {reason}",
+        "No se pudo obtener la billetera de ClawUp: {reason}",
+    ),
+    "balance_error": (
+        "暂时读不到余额：{reason}",
+        "The balance cannot be read right now: {reason}",
+        "No se puede leer el saldo ahora: {reason}",
+    ),
+    "api_wallet": (
+        "它替账户 {account} 交易（这个钱包是该账户的 API 钱包），下面是该账户的资金。该账户的资金请在 Hyperliquid 上转移。",
+        "It trades for the account {account}, as its API wallet, and the funds below are that account's. Move them in Hyperliquid.",
+        "Opera para la cuenta {account}, como su billetera API, y los fondos de abajo son de esa cuenta. Muévelos en Hyperliquid.",
+    ),
+    "perps": ("合约账户", "Perps", "Perpetuos"),
+    "perps_help": (
+        "可提取 {amount} USDC，其余是持仓保证金。",
+        "{amount} USDC withdrawable; the rest is margin for open positions.",
+        "{amount} USDC retirables; el resto es margen de posiciones abiertas.",
+    ),
+    "spot": ("现货账户", "Spot", "Spot"),
+    "positions": ("持仓", "Positions", "Posiciones"),
+    "other_spot": ("其他现货", "Other spot", "Otros spot"),
+    "fund": (
+        "充值：在 Hyperliquid 上，从你自己的账户用「发送」把 USDC 转到这个地址。",
+        "To fund it, send USDC to this address on Hyperliquid (Send, from your own account).",
+        "Para depositar, envía USDC a esta dirección en Hyperliquid (Enviar, desde tu propia cuenta).",
+    ),
+    "trading": ("自动交易", "Trading", "Operaciones"),
+    "trade": ("分析完成后在 Hyperliquid 下单", "Trade on Hyperliquid after an analysis", "Operar en Hyperliquid tras un análisis"),
+    "trade_help": (
+        "分析以美元计价的加密货币后：结论为买入时，按下面的金额买入；结论为卖出时，平掉多单。不开空单，也不改杠杆。每笔订单都要所有绑定的授权都允许，ClawUp 才会签名。",
+        "After an analysis of a crypto ticker quoted in dollars: a Buy buys the order size, and a Sell closes the long. It never opens a short or changes leverage. ClawUp signs each order only if every mandate bound to the agent allows it.",
+        "Tras analizar una cripto cotizada en dólares: una Compra compra el tamaño de orden y una Venta cierra el largo. Nunca abre cortos ni cambia el apalancamiento. ClawUp firma cada orden solo si todos los mandatos del agente lo permiten.",
+    ),
+    "order_usd": ("每笔买入金额（美元）", "Order size (USD)", "Tamaño de orden (USD)"),
+    "save": ("保存", "Save", "Guardar"),
+    "saved": ("已保存。", "Saved.", "Guardado."),
+    "bad_size": (
+        "每笔买入金额需要在 10 到 10000 美元之间（Hyperliquid 的最小订单是 10 美元）。",
+        "The order size must be from $10 to $10000 (Hyperliquid's minimum order is $10).",
+        "El tamaño de orden debe ser de 10 a 10000 USD (la orden mínima de Hyperliquid es de 10 USD).",
+    ),
+    "need_size": ("开启交易前，请先设置每笔买入金额。", "Set an order size to trade.", "Fija un tamaño de orden para operar."),
+    "withdraw": ("提取", "Withdraw", "Retirar"),
+    "amount": ("金额（USDC）", "Amount (USDC)", "Monto (USDC)"),
+    "up_to": ("最多 {amount}", "Up to {amount}", "Hasta {amount}"),
+    "to": ("转到", "To", "A"),
+    "to_help": (
+        "你自己在 Hyperliquid 上的地址，比如你的 MetaMask 地址。",
+        "Your own address on Hyperliquid, such as your MetaMask address.",
+        "Tu propia dirección en Hyperliquid, como la de MetaMask.",
+    ),
+    "withdraw_help": (
+        "从合约账户在 Hyperliquid 上转出，不经过任何链，也不需要 gas。每次提取都要你在 ClawUp 里批准，Agent 自己无法转出资金。Hyperliquid 可能对一个账户的第一笔转出一次性收取 1 USDC。",
+        "Sent from perps on Hyperliquid: no chain and no gas. You approve each withdrawal in ClawUp; the agent cannot move funds on its own. Hyperliquid may charge 1 USDC, once, on an account's first transfer out.",
+        "Se envía desde perpetuos en Hyperliquid: sin cadena ni gas. Apruebas cada retiro en ClawUp; el agente no puede mover fondos por su cuenta. Hyperliquid puede cobrar 1 USDC, una vez, en la primera transferencia de salida de una cuenta.",
+    ),
+    "move": ("现货与合约之间划转", "Move between spot and perps", "Mover entre spot y perpetuos"),
+    "to_perps": ("现货 → 合约", "Spot → perps", "Spot → perpetuos"),
+    "to_spot": ("合约 → 现货", "Perps → spot", "Perpetuos → spot"),
+    "move_help": ("每次划转都要你在 ClawUp 里批准。", "You approve each move in ClawUp.", "Apruebas cada movimiento en ClawUp."),
+    "bad_amount": (
+        "请输入大于 0、最多 6 位小数的金额。",
+        "Enter an amount above 0, with at most 6 decimals.",
+        "Ingresa un monto mayor que 0, con hasta 6 decimales.",
+    ),
+    "bad_to": ("请输入一个 0x 开头的地址。", "Enter an address starting with 0x.", "Ingresa una dirección que empiece con 0x."),
+    "self_to": ("这是 Agent 自己的地址。", "That is the agent's own address.", "Esa es la dirección del propio agente."),
+    "over": ("最多可以转 {amount} USDC。", "At most {amount} USDC can be moved.", "Se pueden mover como máximo {amount} USDC."),
+    "not_own": (
+        "这个 Agent 替别的账户交易，不能从这里转移资金。",
+        "This agent trades for another account, so funds are not moved from here.",
+        "Este agente opera para otra cuenta, así que los fondos no se mueven desde aquí.",
+    ),
+    "approve_it": ("请在下面核对并批准。", "Check it below, and approve it.", "Revísalo abajo y apruébalo."),
+    "unknown": ("没有这个操作。", "There is no such action.", "No existe esa acción."),
+    "failed": ("没有完成：{reason}", "That did not go through: {reason}", "No se completó: {reason}"),
+    "summary_withdraw": (
+        "从 Agent 的 Hyperliquid 合约账户转出 {amount} USDC 到 {to}。",
+        "Send {amount} USDC from the agent's perps on Hyperliquid to {to}.",
+        "Enviar {amount} USDC de los perpetuos del agente en Hyperliquid a {to}.",
+    ),
+    "summary_to_perps": (
+        "在 Agent 的 Hyperliquid 账户里，把 {amount} USDC 从现货转到合约。",
+        "Move {amount} USDC from spot to perps in the agent's Hyperliquid account.",
+        "Mover {amount} USDC de spot a perpetuos en la cuenta de Hyperliquid del agente.",
+    ),
+    "summary_to_spot": (
+        "在 Agent 的 Hyperliquid 账户里，把 {amount} USDC 从合约转到现货。",
+        "Move {amount} USDC from perps to spot in the agent's Hyperliquid account.",
+        "Mover {amount} USDC de perpetuos a spot en la cuenta de Hyperliquid del agente.",
+    ),
+    "status_pending": ("等待你批准：{what}", "Waiting for your approval: {what}", "Esperando tu aprobación: {what}"),
+    "status_sent": ("已完成：{what}", "Done: {what}", "Hecho: {what}"),
+    "status_declined": ("已拒绝，没有转出：{what}", "Declined, nothing moved: {what}", "Rechazado, no se movió nada: {what}"),
+    "status_expired": ("已过期，没有转出：{what}", "Expired, nothing moved: {what}", "Expiró, no se movió nada: {what}"),
+    "status_failed": ("没有成功：{what}（{reason}）", "Did not go through: {what} ({reason})", "No se completó: {what} ({reason})"),
+}
+ADDRESS_RE = re.compile(r"0x[0-9a-fA-F]{40}")
+APPROVAL_POLL_SECONDS = 2.0
+APPROVAL_WATCH_SECONDS = 15 * 60  # past ClawUp's 10-minute expiry
+
+
+def tr(locale: str, key: str, **values) -> str:
+    text = PANEL_TEXT[key][LOCALES.index(locale) if locale in LOCALES else 1]
+    return text.format(**values) if values else text
+
+
+class Transfers:
+    """Funds moved by the owner's approval. Each is asked once; a thread
+    waits for the decision and posts the signed action to Hyperliquid. Only
+    the latest is shown on the panel."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._stopping = threading.Event()
+        self.latest: dict | None = None
+
+    def stop(self) -> None:
+        """Stops waiting for decisions (tests; the shim's exit ends them anyway)."""
+        self._stopping.set()
+
+    def start(self, kind: str, values: dict, approval_id: str, action: dict, nonce: int) -> None:
+        transfer = {"kind": kind, "values": values, "approval": approval_id, "status": "pending", "reason": ""}
+        with self._lock:
+            self.latest = transfer
+        threading.Thread(target=self._watch, args=(transfer, action, nonce), daemon=True).start()
+
+    def _finish(self, transfer: dict, status: str, reason: str = "") -> None:
+        with self._lock:
+            transfer["status"], transfer["reason"] = status, reason
+        _log(f"transfer {transfer['kind']} (approval {transfer['approval']}): {status} {reason}".rstrip())
+
+    def _watch(self, transfer: dict, action: dict, nonce: int) -> None:
+        deadline = time.time() + APPROVAL_WATCH_SECONDS
+        while time.time() < deadline:
+            if self._stopping.wait(APPROVAL_POLL_SECONDS):
+                return
+            try:
+                decided = hl_trade.approval(transfer["approval"])
+            except hl_trade.Refused as exc:
+                _log(f"approval {transfer['approval']} unreadable for now: {exc}")
+                continue
+            status = decided.get("status")
+            if status == "pending":
+                continue
+            if status == "approved" and isinstance(decided.get("signature"), str):
+                try:
+                    hl_trade.post_signed(action, nonce, decided["signature"])
+                except (hl_trade.Refused, ValueError) as exc:
+                    self._finish(transfer, "failed", str(exc))
+                    return
+                self._finish(transfer, "sent")
+                return
+            self._finish(transfer, "declined" if status == "declined" else "expired")
+            return
+        self._finish(transfer, "expired")
+
+    def shown(self, locale: str) -> dict | None:
+        with self._lock:
+            t = dict(self.latest) if self.latest else None
+        if t is None:
+            return None
+        what = tr(locale, f"summary_{t['kind']}", **t["values"])
+        tone = {"pending": "warning", "sent": "ok", "failed": "error"}.get(t["status"], "muted")
+        return {"type": "text", "tone": tone, "text": tr(locale, f"status_{t['status']}", what=what, reason=t["reason"])}
+
+
+TRANSFERS = Transfers()
+
+
+def _text(text: str, tone: str = "normal") -> dict:
+    return {"type": "text", "text": text, "tone": tone}
+
+
+def panel_view(locale: str) -> dict:
+    """The panel: the wallet's funds on Hyperliquid, the trading settings, and
+    (when the wallet trades for its own account) withdrawing and moving funds."""
+    t = lambda key, **v: tr(locale, key, **v)  # noqa: E731
+    trade, order_usd = trade_settings()
+    wallet: list = []
+    address, own, held = None, True, None
+    try:
+        address = hl_trade.wallet_address()
+    except hl_trade.Refused as exc:
+        if exc.code == "WALLET_NOT_CREATED":
+            wallet.append(_text(t("no_wallet"), "warning"))
+        else:
+            wallet.append(_text(t("wallet_error", reason=str(exc)[:300]), "error"))
+    if address:
+        wallet.append({"type": "copy", "label": t("address"), "value": address})
+        try:
+            account = hl_trade.trading_account()
+            own = account.lower() == address.lower()
+            if not own:
+                wallet.append(_text(t("api_wallet", account=account), "muted"))
+            held = hl_trade.holdings(account)
+        except hl_trade.Refused as exc:
+            wallet.append(_text(t("balance_error", reason=str(exc)[:300]), "error"))
+    if held is not None:
+        perps = {"type": "value", "label": t("perps"), "value": f"{hl_trade.shown(held['perps'])} USDC"}
+        if held["withdrawable"] != held["perps"]:
+            perps["help"] = t("perps_help", amount=hl_trade.shown(held["withdrawable"]))
+        wallet.append(perps)
+        wallet.append({"type": "value", "label": t("spot"), "value": f"{hl_trade.shown(held['spot_usdc'])} USDC"})
+        if held["positions"]:
+            wallet.append({"type": "value", "label": t("positions"),
+                           "value": " · ".join(f"{c} {s}" for c, s in held["positions"])[:200]})
+        if held["spot"]:
+            wallet.append({"type": "value", "label": t("other_spot"),
+                           "value": " · ".join(f"{c} {s}" for c, s in held["spot"])[:200]})
+    if address and own:
+        wallet.append(_text(t("fund"), "muted"))
+    latest = TRANSFERS.shown(locale)
+    if latest:
+        wallet.append(latest)
+
+    sections = [
+        {"title": t("wallet"), "items": wallet},
+        {"title": t("trading"), "items": [
+            {"type": "toggle", "id": "trade", "label": t("trade"), "value": trade, "help": t("trade_help")},
+            {"type": "input", "id": "order_usd", "label": t("order_usd"), "kind": "number",
+             "value": f"{order_usd:g}" if order_usd > 0 else "", "placeholder": "25"},
+            {"type": "button", "action": "save", "label": t("save"), "inputs": ["trade", "order_usd"]},
+        ]},
+    ]
+    if held is not None and own:
+        sections.append({"title": t("withdraw"), "items": [
+            {"type": "input", "id": "amount", "label": t("amount"), "kind": "number",
+             "placeholder": t("up_to", amount=hl_trade.shown(held["withdrawable"]))},
+            {"type": "input", "id": "to", "label": t("to"), "kind": "address", "placeholder": "0x…",
+             "help": t("to_help")},
+            {"type": "button", "action": "withdraw", "label": t("withdraw"), "inputs": ["amount", "to"],
+             "primary": True},
+            _text(t("withdraw_help"), "muted"),
+        ]})
+        sections.append({"title": t("move"), "items": [
+            {"type": "input", "id": "move_amount", "label": t("amount"), "kind": "number"},
+            {"type": "button", "action": "to_perps", "label": t("to_perps"), "inputs": ["move_amount"]},
+            {"type": "button", "action": "to_spot", "label": t("to_spot"), "inputs": ["move_amount"]},
+            _text(t("move_help"), "muted"),
+        ]})
+    return {"title": t("title"), "sections": sections}
+
+
+def panel_act(action: str, inputs: dict, locale: str) -> tuple[int, dict]:
+    """One panel button: (HTTP status, answer). Moving funds is only asked
+    for here; it happens once the owner approves it in ClawUp."""
+    t = lambda key, **v: tr(locale, key, **v)  # noqa: E731
+    if action == "save":
+        trade = inputs.get("trade") is True
+        raw = str(inputs.get("order_usd") or "").strip()
+        try:
+            usd = float(raw) if raw else 0.0
+        except ValueError:
+            usd = -1.0
+        if not (usd == 0 or MIN_ORDER_USD <= usd <= MAX_ORDER_USD):  # also NaN
+            return 400, {"message": t("bad_size")}
+        if trade and usd <= 0:
+            return 400, {"message": t("need_size")}
+        save_trade_settings(trade, usd)
+        _log(f"panel: trading {'on' if trade else 'off'}, order size ${usd:g}")
+        return 200, {"message": t("saved"), "tone": "ok"}
+    if action not in ("withdraw", "to_perps", "to_spot"):
+        return 400, {"message": t("unknown")}
+
+    amount = hl_trade.usdc(str(inputs.get("move_amount" if action != "withdraw" else "amount") or ""))
+    if amount is None:
+        return 400, {"message": t("bad_amount")}
+    to = str(inputs.get("to") or "").strip()
+    if action == "withdraw" and not ADDRESS_RE.fullmatch(to):
+        return 400, {"message": t("bad_to")}
+    try:
+        address = hl_trade.wallet_address()
+        if hl_trade.trading_account().lower() != address.lower():
+            return 409, {"message": t("not_own")}
+        if action == "withdraw" and to.lower() == address.lower():
+            return 400, {"message": t("self_to")}
+        held = hl_trade.holdings(address)
+        available = held["spot_usdc"] if action == "to_perps" else held["withdrawable"]
+        if hl_trade.micro(amount) > available:
+            return 400, {"message": t("over", amount=hl_trade.shown(available))}
+        now = int(time.time() * 1000)
+        if action == "withdraw":
+            values = {"amount": amount, "to": to.lower()}
+            signed, typed = hl_trade.usd_send(to, amount, now)
+        else:
+            values = {"amount": amount}
+            signed, typed = hl_trade.usd_class_transfer(amount, action == "to_perps", now)
+        approval_id = hl_trade.ask_approval(typed, tr(locale, f"summary_{action}", **values))
+    except hl_trade.Refused as exc:
+        return 502, {"message": t("failed", reason=str(exc)[:300])}
+    TRANSFERS.start(action, values, approval_id, signed, now)
+    _log(f"panel: {action} {amount} USDC asked for approval {approval_id}")
+    return 200, {"approval": approval_id, "message": t("approve_it")}
+
+
+def _handle_panel(handler: BaseHTTPRequestHandler, panel: dict) -> None:
+    locale = panel.get("locale") if panel.get("locale") in LOCALES else "en"
+    action = panel.get("action")
+    try:
+        if action is None:
+            _send_json(handler, 200, panel_view(locale))
+            return
+        inputs = panel.get("inputs") if isinstance(panel.get("inputs"), dict) else {}
+        status, answer = panel_act(str(action), inputs, locale)
+    except Exception as exc:  # the panel answers, whatever happens
+        _log(f"panel failed: {type(exc).__name__}: {exc}")
+        status, answer = 500, {"message": tr(locale, "failed", reason=type(exc).__name__)}
+    _send_json(handler, status, answer)
 
 
 def _start_proc(run: Run) -> None:
@@ -825,6 +1191,13 @@ def _handle_chat(handler: BaseHTTPRequestHandler, body: bytes, from_channel: boo
         return
 
     stream = bool(payload.get("stream"))
+    if isinstance(payload, dict) and "panel" in payload:
+        # The owner's panel, not a conversation: never a message, no analysis.
+        if not isinstance(payload["panel"], dict) or payload.get("messages") or stream:
+            _send_json(handler, 400, {"error": {"message": "a panel request has a panel object, no messages, and is not streamed", "type": "invalid_request"}})
+            return
+        _handle_panel(handler, payload["panel"])
+        return
     text = last_user_text(payload.get("messages"))
 
     if not text.strip():

@@ -31,3 +31,8 @@ jobs:
         env:
           TA_IMAGE: ta:test
         run: python3 -m unittest -v tradingagents/tests/test_image.py
+
+      - name: Run the tests that need the Hyperliquid SDK, with the image's own
+        run: >-
+          docker run --rm -v "$PWD/tradingagents:/w:ro" -w /w --entrypoint /opt/hl/bin/python ta:test
+          -m unittest -v tests.test_hl_trade.SignsForTheSdk tests.test_panel.AsTheSdkSigns
